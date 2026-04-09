@@ -1009,10 +1009,16 @@ static void sortSegmentsAndSections() {
 
       if (!isecPriorities.empty()) {
         if (auto *merged = dyn_cast<ConcatOutputSection>(osec)) {
-          llvm::stable_sort(
-              merged->inputs, [&](InputSection *a, InputSection *b) {
-                return isecPriorities.lookup(a) < isecPriorities.lookup(b);
-              });
+          // Don't reorder __eh_frame sections. EH frame records must maintain
+          // their original order: CIE records must precede the FDE records that
+          // reference them. Reordering by priority would break this invariant,
+          // producing invalid CIE pointers in the output.
+          if (merged->name != section_names::ehFrame) {
+            llvm::stable_sort(
+                merged->inputs, [&](InputSection *a, InputSection *b) {
+                  return isecPriorities.lookup(a) < isecPriorities.lookup(b);
+                });
+          }
         }
       }
     }
