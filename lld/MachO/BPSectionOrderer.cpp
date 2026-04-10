@@ -122,6 +122,8 @@ DenseMap<const InputSection *, int> lld::macho::runBalancedPartitioning(
   DenseMap<CachedHashStringRef, std::set<unsigned>> rootSymbolToSectionIdxs;
   for (const auto *file : inputFiles) {
     for (auto *sec : file->sections) {
+      if (sec->orderSensitive)
+        continue;
       for (auto &subsec : sec->subsections) {
         auto *isec = subsec.isec;
         if (!isec || isec->data.empty() || !isec->data.data())
@@ -129,12 +131,6 @@ DenseMap<const InputSection *, int> lld::macho::runBalancedPartitioning(
         // CString section order is handled by
         // {Deduplicated}CStringSection::finalizeContents()
         if (isa<CStringInputSection>(isec) || isec->isFinal)
-          continue;
-        // __eh_frame CIE/FDE ordering is semantically meaningful: each FDE
-        // contains a backward-relative offset to its parent CIE. Reordering
-        // these subsections by compression similarity would break that
-        // invariant, producing invalid CIE pointers in the output.
-        if (isec->getName() == section_names::ehFrame)
           continue;
         // ConcatInputSections are entirely live or dead, so the offset is
         // irrelevant.
