@@ -1,26 +1,31 @@
-# REQUIRES: x86
+# REQUIRES: x86, aarch64
 ## Test that __eh_frame CIE/FDE ordering is preserved even when section
 ## priorities (from order files, BP sorting, etc.) would otherwise reorder
 ## input sections. CIE records must precede the FDE records that reference
 ## them; reordering breaks CIE pointer resolution.
 
 # RUN: rm -rf %t; split-file %s %t
-# RUN: llvm-mc -filetype=obj -emit-compact-unwind-non-canonical=true -triple=x86_64-apple-macos10.15 %t/test.s -o %t/test.o
 
-## Link with an order file that assigns priorities to functions with DWARF
-## unwind entries. Without the fix, this would reorder FDEs before their CIEs.
-# RUN: %lld -lSystem -lc++ %t/test.o -o %t/test -order_file %t/order.txt
-# RUN: llvm-objdump --dwarf=frames %t/test | FileCheck %s
+## x86_64
+# RUN: llvm-mc -filetype=obj -emit-compact-unwind-non-canonical=true -triple=x86_64-apple-macos10.15 %t/test.s -o %t/test-x86_64.o
+# RUN: %lld -lSystem -lc++ %t/test-x86_64.o -o %t/test-x86_64 -order_file %t/order.txt
+# RUN: llvm-objdump --dwarf=frames %t/test-x86_64 2>&1 | FileCheck %s
 
-## Verify that CIE records precede their FDE records (no parse errors).
+## arm64
+# RUN: llvm-mc -filetype=obj -emit-compact-unwind-non-canonical=true -triple=arm64-apple-macos11.0 %t/test.s -o %t/test-arm64.o
+# RUN: %lld -arch arm64 -lSystem -lc++ %t/test-arm64.o -o %t/test-arm64 -order_file %t/order.txt
+# RUN: llvm-objdump --dwarf=frames %t/test-arm64 2>&1 | FileCheck %s
+
+## Verify that CIE records precede their FDE records and that
+## FDE records successfully reference their CIEs (no parse errors).
 # CHECK: .eh_frame contents:
 # CHECK: {{[0-9a-f]+}} {{.*}} CIE
+# CHECK-NOT: error
+# CHECK-NOT: warning
 # CHECK: {{[0-9a-f]+}} {{.*}} FDE
-
-## Verify no "failed due to missing CIE" errors appear.
-# RUN: llvm-objdump --dwarf=frames %t/test 2>&1 | FileCheck %s --check-prefix=NO-ERROR
-# NO-ERROR-NOT: error
-# NO-ERROR-NOT: failed due to missing CIE
+# CHECK-NOT: error
+# CHECK-NOT: warning
+# CHECK: {{[0-9a-f]+}} {{.*}} FDE
 
 #--- order.txt
 ## Order _h before _g to trigger reordering pressure on the eh_frame entries.
