@@ -476,6 +476,8 @@ void darwin::Linker::AddLinkArgs(Compilation &C, const ArgList &Args,
   Args.AddLastArg(CmdArgs, options::OPT_dylinker);
   Args.AddLastArg(CmdArgs, options::OPT_Mach);
 
+  // ld64.lld configures LTO directly, while Apple ld forwards the legacy
+  // -mllvm options to libLTO.
   if (LinkerIsLLD) {
     if (auto *CSPGOGenerateArg = getLastCSProfileGenerateArg(Args)) {
       SmallString<128> Path(CSPGOGenerateArg->getNumValues() == 0
@@ -553,18 +555,16 @@ static bool checkRemarksOptions(const Driver &D, const ArgList &Args,
 
 static void renderRemarksOptions(const ArgList &Args, ArgStringList &CmdArgs,
                                  const llvm::Triple &Triple,
-                                 const InputInfo &Output, const JobAction &JA) {
+                                 const InputInfo &Output, const JobAction &JA,
+                                 bool LinkerIsLLD) {
   StringRef Format = "yaml";
   if (const Arg *A = Args.getLastArg(options::OPT_fsave_optimization_record_EQ))
     Format = A->getValue();
 
-  CmdArgs.push_back("-mllvm");
-  CmdArgs.push_back("-lto-pass-remarks-output");
-  CmdArgs.push_back("-mllvm");
-
+  const char *RemarksFilename;
   const Arg *A = Args.getLastArg(options::OPT_foptimization_record_file_EQ);
   if (A) {
-    CmdArgs.push_back(A->getValue());
+    RemarksFilename = A->getValue();
   } else {
     assert(Output.isFilename() && "Unexpected ld output.");
     SmallString<128> F;
@@ -572,8 +572,37 @@ static void renderRemarksOptions(const ArgList &Args, ArgStringList &CmdArgs,
     F += ".opt.";
     F += Format;
 
-    CmdArgs.push_back(Args.MakeArgString(F));
+    RemarksFilename = Args.MakeArgString(F);
   }
+
+  if (LinkerIsLLD) {
+    CmdArgs.push_back(
+        Args.MakeArgString(Twine("--opt-remarks-filename=") + RemarksFilename));
+
+    if (const Arg *A =
+            Args.getLastArg(options::OPT_foptimization_record_passes_EQ))
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("--opt-remarks-passes=") + A->getValue()));
+
+    if (!Format.empty())
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("--opt-remarks-format=") + Format));
+
+    if (getLastProfileUseArg(Args)) {
+      CmdArgs.push_back("--opt-remarks-with-hotness");
+
+      if (const Arg *A =
+              Args.getLastArg(options::OPT_fdiagnostics_hotness_threshold_EQ))
+        CmdArgs.push_back(Args.MakeArgString(
+            Twine("--opt-remarks-hotness-threshold=") + A->getValue()));
+    }
+    return;
+  }
+
+  CmdArgs.push_back("-mllvm");
+  CmdArgs.push_back("-lto-pass-remarks-output");
+  CmdArgs.push_back("-mllvm");
+  CmdArgs.push_back(RemarksFilename);
 
   if (const Arg *A =
           Args.getLastArg(options::OPT_foptimization_record_passes_EQ)) {
@@ -641,7 +670,8 @@ void darwin::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   if (willEmitRemarks(Args) &&
       checkRemarksOptions(getToolChain().getDriver(), Args,
                           getToolChain().getTriple()))
-    renderRemarksOptions(Args, CmdArgs, getToolChain().getTriple(), Output, JA);
+    renderRemarksOptions(Args, CmdArgs, getToolChain().getTriple(), Output, JA,
+                         LinkerIsLLD);
 
   // Propagate the -moutline flag to the linker in LTO.
   if (Arg *A =

@@ -9,6 +9,41 @@
 // RUN: FileCheck -check-prefix=PASS_REMARKS_OUTPUT %s < %t.log
 // PASS_REMARKS_OUTPUT: "-mllvm" "-lto-pass-remarks-output" "-mllvm" "foo/bar.out.opt.yaml" "-mllvm" "-lto-pass-remarks-format=yaml"
 // PASS_REMARKS_OUTPUT-NOT: -lto-pass-remarks-with-hotness
+// PASS_REMARKS_OUTPUT-NOT: --opt-remarks-
+
+// Check native lld options for ordinary, Full LTO, and ThinLTO links.
+// RUN: %clang -target x86_64-apple-darwin12 %t.o -fuse-ld=lld \
+// RUN:   -B%S/Inputs/lld -fsave-optimization-record -### \
+// RUN:   -o foo/bar.out 2>&1 | FileCheck \
+// RUN:   --check-prefixes=LLD_PASS_REMARKS_OUTPUT,LLD_NO_LEGACY %s
+// RUN: %clang -target x86_64-apple-darwin12 %t.o -fuse-ld=lld \
+// RUN:   -B%S/Inputs/lld -flto=full -fsave-optimization-record -### \
+// RUN:   -o foo/bar.out 2>&1 | FileCheck \
+// RUN:   --check-prefixes=LLD_PASS_REMARKS_OUTPUT,LLD_NO_LEGACY %s
+// RUN: %clang -target x86_64-apple-darwin12 %t.o -fuse-ld=lld \
+// RUN:   -B%S/Inputs/lld -flto=thin -fsave-optimization-record -### \
+// RUN:   -o foo/bar.out 2>&1 | FileCheck \
+// RUN:   --check-prefixes=LLD_PASS_REMARKS_OUTPUT,LLD_NO_LEGACY %s
+// LLD_PASS_REMARKS_OUTPUT: "{{.*}}ld64.lld"
+// LLD_PASS_REMARKS_OUTPUT-SAME: "--opt-remarks-filename=foo/bar.out.opt.yaml"
+// LLD_PASS_REMARKS_OUTPUT-SAME: "--opt-remarks-format=yaml"
+// LLD_PASS_REMARKS_OUTPUT-NOT: --opt-remarks-passes
+// LLD_PASS_REMARKS_OUTPUT-NOT: --opt-remarks-with-hotness
+// LLD_NO_LEGACY-NOT: -lto-pass-remarks
+
+// Check that every optimization-record option uses its native lld spelling.
+// RUN: %clang -target x86_64-apple-darwin12 %t.o -fuse-ld=lld \
+// RUN:   -B%S/Inputs/lld -flto=thin -fsave-optimization-record=some-format \
+// RUN:   -foptimization-record-file=remarks-custom.opt \
+// RUN:   -foptimization-record-passes=inline -fprofile-instr-use=blah \
+// RUN:   -fdiagnostics-hotness-threshold=100 -### -o foo/bar.out 2>&1 | \
+// RUN:   FileCheck --check-prefixes=LLD_ALL_REMARKS,LLD_NO_LEGACY %s
+// LLD_ALL_REMARKS: "{{.*}}ld64.lld"
+// LLD_ALL_REMARKS-SAME: "--opt-remarks-filename=remarks-custom.opt"
+// LLD_ALL_REMARKS-SAME: "--opt-remarks-passes=inline"
+// LLD_ALL_REMARKS-SAME: "--opt-remarks-format=some-format"
+// LLD_ALL_REMARKS-SAME: "--opt-remarks-with-hotness"
+// LLD_ALL_REMARKS-SAME: "--opt-remarks-hotness-threshold=100"
 
 // RUN: %clang -target x86_64-apple-darwin12 %t.o -fsave-optimization-record -### 2> %t.log
 // RUN: FileCheck -check-prefix=PASS_REMARKS_OUTPUT_NO_O %s < %t.log
