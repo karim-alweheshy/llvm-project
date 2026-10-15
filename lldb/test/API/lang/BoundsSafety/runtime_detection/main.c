@@ -21,7 +21,8 @@ int main(int argc, char **argv) {
 #ifdef LATE_LOAD
   void *library = dlopen(argv[1], RTLD_NOW);
   assert(library);
-  void (*call_late_trap)(void) = (void (*)(void))dlsym(library, "call_late_trap");
+  void (*call_late_trap)(void) =
+      (void (*)(void))dlsym(library, "call_late_trap");
   assert(call_late_trap);
   call_late_trap();
 #endif

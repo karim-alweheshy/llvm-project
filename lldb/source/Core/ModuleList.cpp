@@ -2092,7 +2092,7 @@ To run all discovered debug scripts in this session:
 
     settings set target.load-script-from-symbol-file true
 )",
-      // clang-format on
+              // clang-format on
               module.GetFileSpec().GetFileNameStrippingExtension(),
               *trusted ? "a trusted" : "an untrusted",
               scripting_fspec.GetPath()),

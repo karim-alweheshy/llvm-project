@@ -19,8 +19,8 @@
 #include "lldb/Utility/StreamString.h"
 #include "lldb/Utility/UUID.h"
 #include "llvm/ADT/BitVector.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include <optional>
 
 // This class needs to be hidden as eventually belongs in a plugin that
