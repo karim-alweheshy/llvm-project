@@ -85,6 +85,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
@@ -2976,8 +2977,32 @@ bool SwiftASTContext::SetupFileSystemFromCacheKey(llvm::StringRef cache_key) {
   return true;
 }
 
-bool SwiftASTContext::DiscoverExplicitMainModule(const SymbolContext &sc,
-                                                 const Module &image) {
+/// Find the main module in a possibly concatenated AST section. The returned
+/// slice borrows the input buffer; callers must retain or copy its contents.
+static StringRef FindMainModuleAST(StringRef data, StringRef module_name,
+                                   const llvm::Triple &triple) {
+  while (!data.empty()) {
+    auto info = swift::serialization::validateSerializedAST(data, {});
+    if (!info.bytes || info.bytes > data.size())
+      return {};
+    if (info.status == swift::serialization::Status::Valid &&
+        info.name == module_name &&
+        swift::serialization::areCompatible(llvm::Triple(info.targetTriple),
+                                            triple))
+      return data.take_front(info.bytes);
+
+    // Serialized Swift modules in an AST section are word-aligned.
+    size_t next = llvm::alignTo(info.bytes, 4);
+    if (next > data.size())
+      return {};
+    data = data.drop_front(next);
+  }
+  return {};
+}
+
+bool SwiftASTContext::DiscoverExplicitMainModule(
+    const SymbolContext &sc, Module &image,
+    std::unique_ptr<llvm::MemoryBuffer> &embedded_main_module) {
   CompileUnit *compile_unit = sc.comp_unit;
   if (!compile_unit)
     return false;
@@ -2987,6 +3012,11 @@ bool SwiftASTContext::DiscoverExplicitMainModule(const SymbolContext &sc,
   if (!cu_imports.size())
     return false;
   const SourceModule &module = cu_imports.front();
+  StringRef module_name = TypeSystemSwiftTypeRef::GetSwiftModuleFor(sc);
+  if (module_name.empty() && module.path.size())
+    module_name = module.path.front();
+  if (module_name.empty())
+    return false;
   std::unique_ptr<llvm::MemoryBuffer> buffer;
   std::optional<std::string> moduleCacheKey;
   // If a dSYM aggregates multiple CAS, pick the one that actually
@@ -3004,7 +3034,6 @@ bool SwiftASTContext::DiscoverExplicitMainModule(const SymbolContext &sc,
   if (auto E = GetModuleContentsFromCAS(module.search_path).moveInto(buffer)) {
     LLDB_LOG_ERROR(GetLog(LLDBLog::Types), std::move(E),
                    "Could not open {1}: {0}", module.search_path);
-    return false;
   } 
   if (!buffer) {
     if (auto E = llvm::errorOrToExpected(llvm::MemoryBuffer::getFile(
@@ -3012,19 +3041,48 @@ bool SwiftASTContext::DiscoverExplicitMainModule(const SymbolContext &sc,
                      .moveInto(buffer)) {
       LLDB_LOG_ERROR(GetLog(LLDBLog::Types), std::move(E),
                      "Could not open {1}: {0}", module.search_path);
-      return false;
     }
   } else {
     moduleCacheKey = module.search_path.GetString();
     SetupFileSystemFromCacheKey(*moduleCacheKey);
   }
-  if (!buffer) {
+  bool is_embedded = false;
+  StringRef main_module_data;
+  if (buffer)
+    main_module_data =
+        FindMainModuleAST(buffer->getBuffer(), module_name, GetTriple());
+  if (main_module_data.empty()) {
+    // Older debug info, and builds without serialized debugging options, can
+    // describe the current module with a source directory rather than the
+    // binary module file. Its own image still has the linker-registered AST.
+    // Do not scan unrelated images or merge their dependency maps here.
+    for (const auto &data : image.GetASTData(eLanguageTypeSwift)) {
+      if (!data)
+        continue;
+      StringRef contents(reinterpret_cast<const char *>(data->GetBytes()),
+                         data->GetByteSize());
+      auto main = FindMainModuleAST(contents, module_name, GetTriple());
+      if (main.empty())
+        continue;
+      buffer = llvm::MemoryBuffer::getMemBufferCopy(main, module_name);
+      main_module_data = buffer->getBuffer();
+      moduleCacheKey.reset();
+      is_embedded = true;
+      break;
+    }
+  }
+  if (main_module_data.empty()) {
     LOG_PRINTF(GetLog(LLDBLog::Types), "Failed to load module: %s",
                module.search_path.GetString().c_str());
     return false;
   }
-  LOG_PRINTF(GetLog(LLDBLog::Types), "Discovered main module %s",
-             module.search_path.GetString().c_str());
+  if (is_embedded)
+    LOG_PRINTF(
+        GetLog(LLDBLog::Types), "Discovered main module %s from image %s",
+        module_name.str().c_str(), image.GetFileSpec().GetPath().c_str());
+  else
+    LOG_PRINTF(GetLog(LLDBLog::Types), "Discovered main module %s",
+               module.search_path.GetString().c_str());
 
   bool discover_implicit_search_paths = false;
   PathMappingList path_remap;
@@ -3032,30 +3090,30 @@ bool SwiftASTContext::DiscoverExplicitMainModule(const SymbolContext &sc,
   bool found_swift_modules = false;
   bool got_serialized_options = false;
   llvm::raw_string_ostream errs(error);
-  StringRef module_name;
-  if (module.path.size())
-    module_name = module.path.front();
   swift::CompilerInvocation fresh_invocation;
-  m_main_swift_module = module.search_path;
+  m_main_swift_module =
+      is_embedded ? ConstString(module_name) : module.search_path;
   m_main_swift_module_map = std::make_unique<swift::ExplicitSwiftModuleMap>();
-  // Add main module to explicit module map.
-  m_main_swift_module_map->insert(
-      {module_name, swift::ExplicitSwiftModuleInputInfo{
-                        moduleCacheKey ? module_name.str() + ".swiftmodule"
-                                       : (std::string)module.search_path,
-                        {},
-                        {},
-                        {},
-                        {},
-                        /*isFramework=*/false,
-                        /*isSystem=*/false,
-                        moduleCacheKey}});
+  // An embedded main module is registered with the memory buffer loader after
+  // configuring the bridging header, rather than using a nonexistent path.
+  if (!is_embedded)
+    m_main_swift_module_map->insert(
+        {module_name, swift::ExplicitSwiftModuleInputInfo{
+                          moduleCacheKey ? module_name.str() + ".swiftmodule"
+                                         : (std::string)module.search_path,
+                          {},
+                          {},
+                          {},
+                          {},
+                          /*isFramework=*/false,
+                          /*isSystem=*/false,
+                          moduleCacheKey}});
   m_explicit_swift_module_map =
       std::make_unique<swift::ExplicitSwiftModuleMap>();
   m_explicit_clang_module_map =
       std::make_unique<swift::ExplicitClangModuleMap>();
   bool found_errors = DeserializeAllCompilerFlags(
-      fresh_invocation, module_name, {}, {buffer->getBuffer()},
+      fresh_invocation, module_name, {}, {main_module_data},
       image.GetSourceMappingList(), discover_implicit_search_paths,
       m_description, errs, got_serialized_options, found_swift_modules,
       /*search_paths_only=*/false, m_explicit_swift_module_map.get(),
@@ -3079,6 +3137,8 @@ bool SwiftASTContext::DiscoverExplicitMainModule(const SymbolContext &sc,
                     module_search_paths, framework_search_paths);
   AddModuleSearchPaths(module_search_paths);
   AddFrameworkSearchPaths(framework_search_paths);
+  if (is_embedded)
+    embedded_main_module = std::move(buffer);
   return true;
 }
 
@@ -3519,9 +3579,11 @@ lldb::TypeSystemSP SwiftASTContext::CreateInstance(
       target_sp ? target_sp->GetSwiftClangOverrideOptions() : "";
 
   bool explicitly_tracked_ebm_build = false;
+  std::unique_ptr<llvm::MemoryBuffer> embedded_main_module;
   std::vector<std::string> module_names;
   if (swift_context && module_sp) {
-    if (swift_ast_sp->DiscoverExplicitMainModule(sc, *module_sp)) {
+    if (swift_ast_sp->DiscoverExplicitMainModule(sc, *module_sp,
+                                                 embedded_main_module)) {
       swift_ast_sp->AddExtraClangArgs(extra_clang_args, module_search_paths,
                                       framework_search_paths, override_opts);
       if (swift_ast_sp->HasExplicitModules() &&
@@ -3618,6 +3680,16 @@ lldb::TypeSystemSP SwiftASTContext::CreateInstance(
       module_to_scan = module_sp;
     swift_ast_sp->DiscoverImplicitlyTrackedModules(modules, module_to_scan,
                                                    module_names);
+  } else if (embedded_main_module) {
+    auto *loader = swift_ast_sp->GetMemoryBufferModuleLoader();
+    if (!loader)
+      return {};
+    auto info = swift::serialization::validateSerializedAST(
+        embedded_main_module->getBuffer(), {});
+    // Discovery validated and copied exactly this module. Transfer ownership
+    // to the loader so its serialized AST remains alive after CreateInstance.
+    loader->registerMemoryBuffer(info.name, std::move(embedded_main_module),
+                                 info.userModuleVersion);
   }
 
   if (!for_expressions && module_sp) {
@@ -5123,7 +5195,8 @@ void SwiftASTContext::RegisterSectionModules(
     return;
 
   // Grab all the AST blobs from the symbol vendor.
-  auto ast_file_datas = module.GetASTData(eLanguageTypeSwift);
+  auto ast_file_datas =
+      module.GetASTData(eLanguageTypeSwift, &m_loaded_ast_files);
   if (ast_file_datas.size())
     LOG_PRINTF(GetLog(LLDBLog::Types),
                "(\"%s\") retrieved %zu AST Data blobs from the symbol vendor "

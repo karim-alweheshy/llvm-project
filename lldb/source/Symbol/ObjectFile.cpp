@@ -507,7 +507,7 @@ size_t ObjectFile::GetData(lldb::offset_t offset, size_t length,
   // The entire file has already been mmap'ed into m_data_nsp, so just copy from
   // there as the back mmap buffer will be shared with shared pointers.
   data_sp = m_data_nsp->GetSubsetExtractorSP(offset, length);
-  return data_sp->GetByteSize();
+  return data_sp ? data_sp->GetByteSize() : 0;
 }
 
 size_t ObjectFile::CopyData(lldb::offset_t offset, size_t length,
@@ -598,7 +598,10 @@ size_t ObjectFile::ReadSectionData(Section *section,
   DataExtractorSP extractor_sp;
   size_t ret_size = GetData(section->GetFileOffset(),
                             GetSectionDataSize(section), extractor_sp);
-  section_data = *extractor_sp;
+  if (extractor_sp)
+    section_data = *extractor_sp;
+  else
+    section_data.Clear();
   return ret_size;
 }
 

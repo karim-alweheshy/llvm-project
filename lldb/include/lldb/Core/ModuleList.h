@@ -435,7 +435,9 @@ public:
 
   void FindSymbolsWithNameAndType(ConstString name,
                                   lldb::SymbolType symbol_type,
-                                  SymbolContextList &sc_list) const;
+                                  SymbolContextList &sc_list,
+                                  bool match_c_linkage_names = false,
+                                  bool include_undefined = true) const;
 
   void FindSymbolsMatchingRegExAndType(const RegularExpression &regex,
                                        lldb::SymbolType symbol_type,

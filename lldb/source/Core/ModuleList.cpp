@@ -74,7 +74,8 @@ using namespace lldb;
 using namespace lldb_private;
 
 // BEGIN SWIFT
-static bool KeepLookingInDylinker(SymbolContextList &sc_list, size_t start_idx);
+static bool KeepLookingInDylinker(SymbolContextList &sc_list, size_t start_idx,
+                                  bool match_c_linkage_names = false);
 // END SWIFT
 
 namespace {
@@ -779,8 +780,8 @@ void ModuleList::FindGlobalVariables(const RegularExpression &regex,
 // looks real, returns false, in which case we should terminate the search.
 // If it returns true, we should go on to look in the dylinker.
 
-static bool KeepLookingInDylinker(SymbolContextList &sc_list,
-                                  size_t start_idx) {
+static bool KeepLookingInDylinker(SymbolContextList &sc_list, size_t start_idx,
+                                  bool match_c_linkage_names) {
   bool keep_looking = true;
   if (sc_list.GetSize() == start_idx) {
     return true;
@@ -790,6 +791,11 @@ static bool KeepLookingInDylinker(SymbolContextList &sc_list,
   size_t num_symbols = sc_list.GetSize();
   for (size_t idx = start_idx; idx < num_symbols; idx++) {
     sc_list.GetContextAtIndex(idx, sc);
+    // General raw-name queries retain named trampolines. They are not a
+    // definition that should hide the real linkage symbol in the dylinker.
+    // The default name indexes already exclude trampolines.
+    if (match_c_linkage_names && sc.symbol && sc.symbol->IsTrampoline())
+      continue;
     if (sc.symbol && sc.symbol->GetType() != lldb::eSymbolTypeUndefined) {
       keep_looking = false;
       break;
@@ -806,7 +812,9 @@ static bool KeepLookingInDylinker(SymbolContextList &sc_list,
 
 void ModuleList::FindSymbolsWithNameAndType(ConstString name,
                                             SymbolType symbol_type,
-                                            SymbolContextList &sc_list) const {
+                                            SymbolContextList &sc_list,
+                                            bool match_c_linkage_names,
+                                            bool include_undefined) const {
   std::lock_guard<std::recursive_mutex> guard(m_modules_mutex);
   // BEGIN SWIFT
   const size_t initial_size = sc_list.GetSize();
@@ -815,19 +823,22 @@ void ModuleList::FindSymbolsWithNameAndType(ConstString name,
   collection dylinker_modules;
   for (pos = m_modules.begin(); pos != end; ++pos) {
     if (!(*pos)->GetIsDynamicLinkEditor())
-      (*pos)->FindSymbolsWithNameAndType(name, symbol_type, sc_list);
+      (*pos)->FindSymbolsWithNameAndType(
+          name, symbol_type, sc_list, match_c_linkage_names, include_undefined);
     else
       dylinker_modules.push_back(*pos);
   }
 
   // Lets see if we found anything but undefined symbols.  If so, then we'll
   // also look in the dylinker.
-  bool keep_looking = KeepLookingInDylinker(sc_list, initial_size);
+  bool keep_looking =
+      KeepLookingInDylinker(sc_list, initial_size, match_c_linkage_names);
 
   if (keep_looking) {
     end = dylinker_modules.end();
     for (pos = dylinker_modules.begin(); pos != end; ++pos)
-      (*pos)->FindSymbolsWithNameAndType(name, symbol_type, sc_list);
+      (*pos)->FindSymbolsWithNameAndType(
+          name, symbol_type, sc_list, match_c_linkage_names, include_undefined);
   }
   // END SWIFT
 }
@@ -1408,7 +1419,7 @@ ModuleList::GetSharedModule(const ModuleSpec &module_spec, ModuleSP &module_sp,
                             llvm::SmallVectorImpl<lldb::ModuleSP> *old_modules,
                             bool *did_create_ptr, bool always_create) {
   SharedModuleList &shared_module_list = GetSharedModuleList();
-  std::lock_guard<std::recursive_mutex> guard(shared_module_list.GetMutex());
+  std::unique_lock<std::recursive_mutex> guard(shared_module_list.GetMutex());
   char path[PATH_MAX];
 
   Status error;
@@ -1422,70 +1433,71 @@ ModuleList::GetSharedModule(const ModuleSpec &module_spec, ModuleSP &module_sp,
   const FileSpec &module_file_spec = module_spec.GetFileSpec();
   const ArchSpec &arch = module_spec.GetArchitecture();
 
-  // Make sure no one else can try and get or create a module while this
-  // function is actively working on it by doing an extra lock on the global
-  // mutex list.
-  if (!always_create) {
+  // Both cache lookups and publication must hold the shared list lock. Module
+  // construction, however, need not block loading unrelated modules.
+  auto find_cached_module = [&]() {
     ModuleList matching_module_list;
     shared_module_list.FindModules(module_spec, matching_module_list);
     const size_t num_matching_modules = matching_module_list.GetSize();
 
-    if (num_matching_modules > 0) {
-      for (size_t module_idx = 0; module_idx < num_matching_modules;
-           ++module_idx) {
-        module_sp = matching_module_list.GetModuleAtIndex(module_idx);
+    for (size_t module_idx = 0; module_idx < num_matching_modules;
+         ++module_idx) {
+      module_sp = matching_module_list.GetModuleAtIndex(module_idx);
 
-        // Make sure the file for the module hasn't been modified
-        if (module_sp->FileHasChanged()) {
-          if (old_modules)
-            old_modules->push_back(module_sp);
+      // Make sure the file for the module hasn't been modified.
+      if (module_sp->FileHasChanged()) {
+        if (old_modules)
+          old_modules->push_back(module_sp);
 
-          Log *log = GetLog(LLDBLog::Modules);
-          if (log != nullptr)
-            LLDB_LOGF(
-                log, "%p '%s' module changed: removing from global module list",
-                static_cast<void *>(module_sp.get()),
-                module_sp->GetFileSpec().GetFilename().GetCString());
+        Log *log = GetLog(LLDBLog::Modules);
+        if (log != nullptr)
+          LLDB_LOGF(log,
+                    "%p '%s' module changed: removing from global module list",
+                    static_cast<void *>(module_sp.get()),
+                    module_sp->GetFileSpec().GetFilename().GetCString());
 
-          shared_module_list.Remove(module_sp);
-          module_sp.reset();
-        } else {
-          // The module matches and the module was not modified from when it
-          // was last loaded.
-          return error;
-        }
+        shared_module_list.Remove(module_sp);
+        module_sp.reset();
+      } else {
+        return true;
       }
+    }
+    return false;
+  };
+
+  if (!always_create && find_cached_module())
+    return error;
+
+  if (!always_create)
+    guard.unlock();
+
+  ModuleSP new_module_sp = std::make_shared<Module>(module_spec);
+  // Validate the architecture, UUID and object type before publishing. This
+  // module is private to this call while its object file is initialized.
+  ObjectFile *object_file = new_module_sp->GetObjectFile();
+  if (!object_file || (uuid_ptr && *uuid_ptr != new_module_sp->GetUUID()) ||
+      object_file->GetType() == ObjectFile::eTypeStubLibrary)
+    new_module_sp.reset();
+
+  if (!always_create) {
+    guard.lock();
+    // Another call, including a recursive object-file callback, may have
+    // published a matching module while construction was in progress. Recheck
+    // even when construction failed, using the original spec (UUIDs can match
+    // modules at a different path).
+    if (find_cached_module()) {
+      // Destroy an unused candidate without holding the shared list lock.
+      guard.unlock();
+      return error;
     }
   }
 
-  if (module_sp)
+  if (new_module_sp) {
+    module_sp = std::move(new_module_sp);
+    if (did_create_ptr)
+      *did_create_ptr = true;
+    shared_module_list.ReplaceEquivalent(module_sp, old_modules);
     return error;
-
-  module_sp = std::make_shared<Module>(module_spec);
-  // Make sure there are a module and an object file since we can specify a
-  // valid file path with an architecture that might not be in that file. By
-  // getting the object file we can guarantee that the architecture matches
-  if (module_sp->GetObjectFile()) {
-    // If we get in here we got the correct arch, now we just need to verify
-    // the UUID if one was given
-    if (uuid_ptr && *uuid_ptr != module_sp->GetUUID()) {
-      module_sp.reset();
-    } else {
-      if (module_sp->GetObjectFile() &&
-          module_sp->GetObjectFile()->GetType() ==
-              ObjectFile::eTypeStubLibrary) {
-        module_sp.reset();
-      } else {
-        if (did_create_ptr) {
-          *did_create_ptr = true;
-        }
-
-        shared_module_list.ReplaceEquivalent(module_sp, old_modules);
-        return error;
-      }
-    }
-  } else {
-    module_sp.reset();
   }
 
   if (module_search_paths_ptr) {
@@ -2023,6 +2035,12 @@ bool ModuleList::LoadScriptingResourceInTargetForModule(Module &module,
   if (script_language == eScriptLanguageNone)
     return true;
 
+  // Discovering scripts can create the module's symbol vendor. Honor the
+  // effective policy before doing that work, including per-module overrides.
+  if (Platform::GetScriptLoadStyleForModule(module.GetFileSpec(), target) ==
+      eLoadScriptFromSymFileFalse)
+    return true;
+
   ScriptInterpreter *script_interpreter = debugger.GetScriptInterpreter();
   if (!script_interpreter) {
     error = Status::FromErrorString("invalid ScriptInterpreter");
@@ -2043,7 +2061,7 @@ bool ModuleList::LoadScriptingResourceInTargetForModule(Module &module,
   if (!feedback_stream.Empty())
     debugger.ReportWarning(feedback_stream.GetString().str(), debugger.GetID());
 
-  const bool trusted = platform_sp->IsSymbolFileTrusted(module);
+  std::optional<bool> trusted;
 
   for (const auto &[scripting_fspec, load_style] : file_specs) {
     if (load_style == eLoadScriptFromSymFileFalse)
@@ -2058,10 +2076,11 @@ bool ModuleList::LoadScriptingResourceInTargetForModule(Module &module,
     case eLoadScriptFromSymFileTrue:
       break;
     case eLoadScriptFromSymFileTrusted:
-      if (trusted)
-        break;
-      LLVM_FALLTHROUGH;
     case eLoadScriptFromSymFileWarn:
+      if (!trusted.has_value())
+        trusted = platform_sp->IsSymbolFileTrusted(module);
+      if (load_style == eLoadScriptFromSymFileTrusted && *trusted)
+        break;
       debugger.ReportWarning(
           llvm::formatv(
               // clang-format off
@@ -2073,9 +2092,9 @@ To run all discovered debug scripts in this session:
 
     settings set target.load-script-from-symbol-file true
 )",
-      // clang-format on
+              // clang-format on
               module.GetFileSpec().GetFileNameStrippingExtension(),
-              trusted ? "a trusted" : "an untrusted",
+              *trusted ? "a trusted" : "an untrusted",
               scripting_fspec.GetPath()),
           debugger.GetID());
 

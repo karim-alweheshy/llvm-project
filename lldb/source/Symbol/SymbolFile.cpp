@@ -119,7 +119,8 @@ SymbolFile *SymbolFile::FindPlugin(ObjectFileSP objfile_sp) {
 }
 
 std::vector<lldb::DataBufferSP>
-SymbolFile::GetASTData(lldb::LanguageType language) {
+SymbolFile::GetASTData(lldb::LanguageType language,
+                       llvm::StringSet<> *loaded_ast_files) {
   // SymbolFile subclasses must add this functionality
   return std::vector<lldb::DataBufferSP>();
 }
@@ -178,6 +179,18 @@ void SymbolFile::AssertModuleLock() {
 }
 
 SymbolFile::RegisterInfoResolver::~RegisterInfoResolver() = default;
+
+bool SymbolFile::MayContainCLinkageSymbols(
+    llvm::ArrayRef<llvm::StringRef> names, SymbolNameLookupKind kind) {
+  return true;
+}
+
+bool SymbolFileCommon::MainObjectFileMayContainCLinkageSymbols(
+    llvm::ArrayRef<llvm::StringRef> names, SymbolNameLookupKind kind) {
+  std::lock_guard<std::recursive_mutex> guard(GetModuleMutex());
+  ObjectFile *object_file = GetMainObjectFile();
+  return !object_file || object_file->MayContainCLinkageSymbols(names, kind);
+}
 
 Symtab *SymbolFileCommon::GetSymtab(bool can_create) {
   std::lock_guard<std::recursive_mutex> guard(GetModuleMutex());

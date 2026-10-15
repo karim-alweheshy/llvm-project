@@ -92,8 +92,35 @@ LLDBMemoryReader::getSymbolAddress(const std::string &name) {
 
   ConstString name_cs(name.c_str(), name.size());
   SymbolContextList sc_list;
-  m_process.GetTarget().GetImages().FindSymbolsWithNameAndType(
-      name_cs, lldb::eSymbolTypeAny, sc_list);
+  // RemoteMirror asks for public linkage names, including mangled Swift
+  // descriptors. Demangled basename aliases are not runtime definitions.
+  auto collect_symbols = [&](bool include_undefined) {
+    sc_list.Clear();
+    m_process.GetTarget().GetImages().FindSymbolsWithNameAndType(
+        name_cs, lldb::eSymbolTypeAny, sc_list,
+        /*match_c_linkage_names=*/true, include_undefined);
+    // The regular name index excludes trampolines. The raw linkage query keeps
+    // them for other consumers, so retain the original exclusion here.
+    for (size_t i = sc_list.GetSize(); i > 0; --i)
+      if (sc_list[i - 1].symbol && sc_list[i - 1].symbol->IsTrampoline())
+        sc_list.RemoveContextAtIndex(i - 1);
+  };
+
+  // A unique definition gives the same address after discarding undefined
+  // references, without materializing tables containing only those references.
+  // Keep the original handling for missing or ambiguous definitions.
+  collect_symbols(/*include_undefined=*/false);
+  SymbolContext definition;
+  if (sc_list.GetSize() == 1 && sc_list.GetContextAtIndex(0, definition) &&
+      definition.symbol) {
+    auto load_addr = definition.symbol->GetLoadAddress(&m_process.GetTarget());
+    if (load_addr != LLDB_INVALID_ADDRESS) {
+      LLDB_LOGV(log, "[MemoryReader] symbol resolved to {0:x}", load_addr);
+      return swift::remote::RemoteAddress(
+          load_addr, swift::remote::RemoteAddress::DefaultAddressSpace);
+    }
+  }
+  collect_symbols(/*include_undefined=*/true);
   if (!sc_list.GetSize()) {
     LLDB_LOGV(log, "[MemoryReader] symbol resolution failed {0}", name);
     return swift::remote::RemoteAddress();
@@ -198,6 +225,15 @@ LLDBMemoryReader::resolvePointerAsSymbol(swift::remote::RemoteAddress address) {
     if (!target.ResolveLoadAddress(address.getRawAddress(), addr))
       return {};
   }
+
+  // This is an optional shortcut: RemoteMirror can instead read the context
+  // descriptor from metadata. Building a cold symbol table for that shortcut
+  // can cost more than the reads it avoids. Keep the original resolver when
+  // symbols are available, including provider and dSYM symbol selection.
+  auto module = addr.GetModule();
+  auto *object_file = module ? module->GetObjectFile() : nullptr;
+  if (!object_file || !object_file->GetSymtab(/*can_create=*/false))
+    return {};
 
   if (auto *symbol = addr.CalculateSymbolContextSymbol()) {
     // Require `addr` to point to the beginning of the symbol since the

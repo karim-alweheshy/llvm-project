@@ -33,6 +33,7 @@
 #include "lldb/Symbol/TypeMap.h"
 #include "lldb/Symbol/VariableList.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorExtras.h"
 #include "llvm/Support/ScopedPrinter.h"
@@ -259,11 +260,47 @@ SymbolFileDWARFDebugMap::~SymbolFileDWARFDebugMap() = default;
 
 void SymbolFileDWARFDebugMap::InitializeObject() {}
 
-void SymbolFileDWARFDebugMap::InitOSO() {
-  if (m_flags.test(kHaveInitializedOSOs))
+void SymbolFileDWARFDebugMap::InitOSOMetadata() {
+  if (m_flags.test(kHaveInitializedOSOMetadata))
     return;
+  m_flags.set(kHaveInitializedOSOMetadata);
+  if (!m_objfile_sp->IsStripped()) {
+    switch (m_objfile_sp->GetType()) {
+    case ObjectFile::eTypeExecutable:
+    case ObjectFile::eTypeDynamicLinker:
+    case ObjectFile::eTypeSharedLibrary:
+      if (const auto *metadata = m_objfile_sp->GetDebugInfoMetadata()) {
+        if (metadata->debug_map_objects) {
+          m_compile_unit_infos.resize(metadata->debug_map_objects->size());
+          for (auto [info, entry] :
+               llvm::zip(m_compile_unit_infos, *metadata->debug_map_objects)) {
+            info.so_file.SetFile(entry.source_file, FileSpec::Style::native);
+            info.oso_path = ConstString(entry.object_file);
+            info.oso_mod_time = llvm::sys::toTimePoint(entry.modification_time);
+          }
+          return;
+        }
+      }
+      break;
+    default:
+      break;
+    }
+  }
+  InitOSO();
+}
+
+void SymbolFileDWARFDebugMap::InitOSO() {
+  if (m_oso_indexes_initialized.load(std::memory_order_acquire))
+    return;
+  std::lock_guard<std::recursive_mutex> guard(GetModuleMutex());
+  if (m_flags.test(kHaveInitializedOSOs))
+    return; // Recursive initialization on this thread, not a ready signal.
 
   m_flags.set(kHaveInitializedOSOs);
+  m_flags.set(kHaveInitializedOSOMetadata);
+  auto publish = llvm::make_scope_exit([&] {
+    m_oso_indexes_initialized.store(true, std::memory_order_release);
+  });
 
   // If the object file has been stripped, there is no sense in looking further
   // as all of the debug symbols for the debug map will not be available
@@ -335,6 +372,11 @@ void SymbolFileDWARFDebugMap::InitOSO() {
   }
   m_debug_map.Sort();
 
+  // Fill the existing entries in place. Callers can already hold references
+  // and missing-object cache entries from metadata discovery.
+  assert((m_compile_unit_infos.empty() ||
+          m_compile_unit_infos.size() == oso_index_count) &&
+         "debug-map metadata differs from symbol parsing");
   m_compile_unit_infos.resize(oso_index_count);
 
   for (uint32_t i = 0; i < oso_index_count; ++i) {
@@ -453,6 +495,9 @@ Module *SymbolFileDWARFDebugMap::GetModuleByCompUnitInfo(
           return nullptr;
         }
       }
+      // An available OSO can call back into the debug map while parsing DWARF.
+      // It needs the original ranges and compacted indices before that happens.
+      InitOSO();
       // Always create a new module for .o files. Why? Because we use the debug
       // map, to add new sections to each .o file and even though a .o file
       // might not have changed, the sections that get added to the .o file can
@@ -545,7 +590,7 @@ uint32_t SymbolFileDWARFDebugMap::GetCompUnitInfoIndex(
 
 SymbolFileDWARF *
 SymbolFileDWARFDebugMap::GetSymbolFileByOSOIndex(uint32_t oso_idx) {
-  unsigned size = m_compile_unit_infos.size();
+  unsigned size = GetNumCompileUnits();
   if (oso_idx < size)
     return GetSymbolFileByCompUnitInfo(&m_compile_unit_infos[oso_idx]);
   return nullptr;
@@ -574,7 +619,6 @@ uint32_t SymbolFileDWARFDebugMap::CalculateAbilities() {
 
   const uint32_t oso_index_count = GetNumCompileUnits();
   if (oso_index_count > 0) {
-    InitOSO();
     if (!m_compile_unit_infos.empty()) {
       return SymbolFile::CompileUnits | SymbolFile::Functions |
              SymbolFile::Blocks | SymbolFile::GlobalVariables |
@@ -586,7 +630,7 @@ uint32_t SymbolFileDWARFDebugMap::CalculateAbilities() {
 }
 
 uint32_t SymbolFileDWARFDebugMap::CalculateNumCompileUnits() {
-  InitOSO();
+  InitOSOMetadata();
   return m_compile_unit_infos.size();
 }
 
@@ -741,7 +785,7 @@ bool SymbolFileDWARFDebugMap::ParseDebugMacros(CompileUnit &comp_unit) {
 void SymbolFileDWARFDebugMap::ForEachSymbolFile(
     std::string description,
     std::function<IterationAction(SymbolFileDWARF &)> closure) {
-  const size_t num_oso_idxs = m_compile_unit_infos.size();
+  const size_t num_oso_idxs = GetNumCompileUnits();
   Progress progress(std::move(description), "", num_oso_idxs,
                     /*debugger=*/nullptr,
                     Progress::kDefaultHighFrequencyReportTime);
@@ -860,6 +904,7 @@ SymbolFileDWARFDebugMap::ResolveSymbolContext(const Address &exe_so_addr,
                                               SymbolContext &sc) {
   std::lock_guard<std::recursive_mutex> guard(GetModuleMutex());
   uint32_t resolved_flags = 0;
+  InitOSO();
   Symtab *symtab = m_objfile_sp->GetSymtab();
   if (symtab) {
     const addr_t exe_file_addr = exe_so_addr.GetFileAddress();
@@ -1048,6 +1093,7 @@ int SymbolFileDWARFDebugMap::SymbolContainsSymbolWithID(
 SymbolFileDWARFDebugMap::CompileUnitInfo *
 SymbolFileDWARFDebugMap::GetCompileUnitInfoForSymbolWithIndex(
     uint32_t symbol_idx, uint32_t *oso_idx_ptr) {
+  InitOSO();
   const uint32_t oso_index_count = m_compile_unit_infos.size();
   CompileUnitInfo *comp_unit_info = nullptr;
   if (oso_index_count) {
@@ -1069,6 +1115,7 @@ SymbolFileDWARFDebugMap::GetCompileUnitInfoForSymbolWithIndex(
 SymbolFileDWARFDebugMap::CompileUnitInfo *
 SymbolFileDWARFDebugMap::GetCompileUnitInfoForSymbolWithID(
     user_id_t symbol_id, uint32_t *oso_idx_ptr) {
+  InitOSO();
   const uint32_t oso_index_count = m_compile_unit_infos.size();
   CompileUnitInfo *comp_unit_info = nullptr;
   if (oso_index_count) {
@@ -1579,7 +1626,8 @@ SymbolFileDWARFDebugMap::AddOSOARanges(SymbolFileDWARF *dwarf2Data,
 }
 
 std::vector<DataBufferSP>
-SymbolFileDWARFDebugMap::GetASTData(lldb::LanguageType language) {
+SymbolFileDWARFDebugMap::GetASTData(lldb::LanguageType language,
+                                    llvm::StringSet<> *loaded_ast_files) {
   Log *log = GetLog(DWARFLog::DebugMap);
 
   std::vector<DataBufferSP> ast_datas;
@@ -1590,64 +1638,97 @@ SymbolFileDWARFDebugMap::GetASTData(lldb::LanguageType language) {
     return ast_datas;
   }
 
-  Symtab *symtab = m_objfile_sp->GetSymtab();
-  if (!symtab) {
-    if (log)
-      log->Printf("SymbolFileDWARFDebugMap::%s() - ignoring because the obj "
-                  "file has no symbol table",
-                  __FUNCTION__);
-    return ast_datas;
-  }
-
-  uint32_t next_idx = 0;
-  bool done = false;
-  do {
-    Symbol *symbol =
-        symtab->FindSymbolWithType(eSymbolTypeASTFile, Symtab::eDebugAny,
-                                   Symtab::eVisibilityAny, next_idx);
-    if (symbol == nullptr) {
-      // We didn't find any more symbols of type eSymbolTypeASTFile.  We are
-      // done looping for them.
-      done = true;
-    } else {
-      // Try to load the specified file.
-      FileSpec file_spec(symbol->GetName().GetCString());
-      bool exists = FileSystem::Instance().Exists(file_spec);
-      if (!exists)
-        if (file_spec.GetDirectory().IsEmpty() && m_objfile_sp) {
-          // For relative paths, search next to the binary.
-          file_spec.SetDirectory(m_objfile_sp->GetFileSpec().GetDirectory());
-          exists = FileSystem::Instance().Exists(file_spec);
-        }
-      if (exists) {
-        // We found the source data for the AST data blob.
-        // Read it in and add it to our return vector.
-        DataBufferSP data_buf_sp =
-            FileSystem::Instance().CreateDataBuffer(file_spec.GetPath());
-        if (data_buf_sp) {
-          ast_datas.push_back(data_buf_sp);
-          if (log)
-            log->Printf("SymbolFileDWARFDebugMap::%s() - found and loaded AST "
-                        "data from file %s",
-                        __FUNCTION__, file_spec.GetPath().c_str());
-        } else if (log) {
-          if (log)
-            log->Printf("SymbolFileDWARFDebugMap::%s() - got empty data buffer "
-                        "SP from extant file %s",
-                        __FUNCTION__, file_spec.GetPath().c_str());
-        }
-      } else {
+  auto &file_system = FileSystem::Instance();
+  auto vfs = file_system.GetVirtualFileSystem();
+  // The default real filesystem implements makeAbsolute by querying the
+  // process cwd. Capture it lazily once for this batch, not for every N_AST.
+  // Other VFS implementations may override path handling, so keep dispatching
+  // through their existing makeAbsolute implementation.
+  const bool use_cwd_snapshot = vfs == llvm::vfs::getRealFileSystem();
+  std::optional<llvm::ErrorOr<std::string>> working_directory;
+  auto make_absolute = [&](FileSpec &file_spec) {
+    if (!use_cwd_snapshot)
+      return !file_system.MakeAbsolute(file_spec);
+    llvm::SmallString<128> path;
+    file_spec.GetPath(path, false);
+    if (llvm::sys::path::is_absolute(path))
+      return true;
+    if (!working_directory)
+      working_directory = vfs->getCurrentWorkingDirectory();
+    if (!*working_directory)
+      return false;
+    llvm::sys::path::make_absolute(working_directory->get(), path);
+    file_spec.SetFile(path, file_spec.GetPathStyle());
+    return true;
+  };
+  auto load_ast = [&](llvm::StringRef path) {
+    // Try to load the specified file.
+    FileSpec file_spec(path);
+    const bool search_adjacent = file_spec.GetDirectory().IsEmpty();
+    std::string loaded_path;
+    auto already_loaded = [&]() {
+      loaded_path.clear();
+      if (!loaded_ast_files)
+        return false;
+      FileSpec absolute_file(file_spec);
+      if (!make_absolute(absolute_file))
+        return false;
+      loaded_path = absolute_file.GetPath();
+      // Use the same anchored path for the key and the actual file access,
+      // even if the process cwd changes while this batch is being read.
+      file_spec = std::move(absolute_file);
+      return loaded_ast_files->contains(loaded_path);
+    };
+    bool duplicate = already_loaded();
+    bool exists = !duplicate && file_system.Exists(file_spec);
+    if (!exists && !duplicate)
+      if (search_adjacent && m_objfile_sp) {
+        // For relative paths, search next to the binary.
+        file_spec.SetDirectory(m_objfile_sp->GetFileSpec().GetDirectory());
+        duplicate = already_loaded();
+        exists = !duplicate && file_system.Exists(file_spec);
+      }
+    if (duplicate) {
+      LLDB_LOG(log, "AST file already loaded by this consumer: {0}",
+               loaded_path);
+    } else if (exists) {
+      // We found the source data for the AST data blob.
+      // Read it in and add it to our return vector.
+      DataBufferSP data_buf_sp =
+          file_system.CreateDataBuffer(file_spec.GetPath());
+      if (data_buf_sp) {
+        if (loaded_ast_files && !loaded_path.empty())
+          loaded_ast_files->insert(loaded_path);
+        ast_datas.push_back(data_buf_sp);
         if (log)
-          log->Printf("SymbolFileDWARFDebugMap::%s() - found reference to AST "
-                      "file %s, but could not find the file, ignoring",
+          log->Printf("SymbolFileDWARFDebugMap::%s() - found and loaded AST "
+                      "data from file %s",
+                      __FUNCTION__, file_spec.GetPath().c_str());
+      } else if (log) {
+        if (log)
+          log->Printf("SymbolFileDWARFDebugMap::%s() - got empty data buffer "
+                      "SP from extant file %s",
                       __FUNCTION__, file_spec.GetPath().c_str());
       }
-
-      // Regardless of whether we could find the specified file, start the next
-      // symbol search at the index past the one we just found.
+    } else {
+      if (log)
+        log->Printf("SymbolFileDWARFDebugMap::%s() - found reference to AST "
+                    "file %s, but could not find the file, ignoring",
+                    __FUNCTION__, file_spec.GetPath().c_str());
+    }
+  };
+  if (const auto *metadata = m_objfile_sp->GetDebugInfoMetadata()) {
+    for (llvm::StringRef path : metadata->swift_ast_files)
+      load_ast(path);
+  } else if (Symtab *symtab = m_objfile_sp->GetSymtab()) {
+    uint32_t next_idx = 0;
+    while (Symbol *symbol =
+               symtab->FindSymbolWithType(eSymbolTypeASTFile, Symtab::eDebugAny,
+                                          Symtab::eVisibilityAny, next_idx)) {
+      load_ast(symbol->GetName().GetStringRef());
       ++next_idx;
     }
-  } while (!done);
+  }
 
   // Return the vector of AST data blobs
   if (log)
@@ -1679,6 +1760,7 @@ Status SymbolFileDWARFDebugMap::CalculateFrameVariableError(StackFrame &frame) {
   // map below.
   Address pc_addr = frame.GetFrameCodeAddress();
   if (pc_addr.GetModule() == m_objfile_sp->GetModule()) {
+    InitOSO();
     Symtab *symtab = m_objfile_sp->GetSymtab();
     if (symtab) {
       const DebugMap::Entry *debug_map_entry =

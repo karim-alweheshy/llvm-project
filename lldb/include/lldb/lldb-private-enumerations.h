@@ -57,6 +57,14 @@ enum class AddressClass {
   eRuntime
 };
 
+/// Eligibility of exact symbol-table names for a conservative absence proof.
+/// This does not describe functions supplied by DWARF or inline instances.
+enum class SymbolNameLookupKind {
+  Any,     ///< All symbol types, including undefined references and stubs.
+  Defined, ///< All types except Undefined, including named stubs.
+  Function ///< Code, Resolver, ReExported or Absolute, as FindFunctionSymbols.
+};
+
 // Votes - Need a tri-state, yes, no, no opinion...
 enum Vote { eVoteNo = -1, eVoteNoOpinion = 0, eVoteYes = 1 };
 

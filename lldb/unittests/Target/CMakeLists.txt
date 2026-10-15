@@ -2,6 +2,7 @@ add_lldb_unittest(TargetTests
   ABITest.cpp
   DynamicRegisterInfoTest.cpp
   ExecutionContextTest.cpp
+  InstrumentationRuntimeTest.cpp
   Language.cpp
   LocateModuleCallbackTest.cpp
   MemoryRegionInfoTest.cpp
@@ -20,6 +21,7 @@ add_lldb_unittest(TargetTests
   LINK_LIBS
       lldbCore
       lldbHost
+      lldbPluginInstrumentationRuntimeBoundsSafety
       lldbPluginObjectFileBreakpad
       lldbPluginObjectFileELF
       lldbPluginPlatformLinux
@@ -31,6 +33,7 @@ add_lldb_unittest(TargetTests
       lldbSymbol
       lldbUtility
       lldbUtilityHelpers
+      LLVMTestingSupport
   )
 
 set(test_inputs

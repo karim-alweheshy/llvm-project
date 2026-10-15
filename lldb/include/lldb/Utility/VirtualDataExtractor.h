@@ -24,8 +24,8 @@ namespace lldb_private {
 /// - data: physical offset in the underlying data buffer
 ///
 /// Reads are translated from virtual addresses to physical offsets using
-/// this lookup table. Reads cannot cross entry boundaries and this is
-/// enforced with assertions.
+/// this lookup table. Checked reads and subsets reject missing, overflowing,
+/// truncated or cross-entry ranges.
 class VirtualDataExtractor : public DataExtractor {
 public:
   /// Type alias for the range map used internally.

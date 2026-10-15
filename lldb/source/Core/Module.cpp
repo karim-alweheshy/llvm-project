@@ -117,9 +117,7 @@ std::recursive_mutex &Module::GetAllocationModuleCollectionMutex() {
   // will tear itself down before the "g_module_collection_mutex" below will.
   // So we leak a Mutex object below to safeguard against that
 
-  static std::recursive_mutex *g_module_collection_mutex = nullptr;
-  if (g_module_collection_mutex == nullptr)
-    g_module_collection_mutex = new std::recursive_mutex; // NOTE: known leak
+  static auto *g_module_collection_mutex = new std::recursive_mutex;
   return *g_module_collection_mutex;
 }
 
@@ -855,10 +853,16 @@ void Module::FindFunctions(const Module::LookupInfo &lookup_info,
                            options.include_inlines, sc_list);
     // Now check our symbol table for symbols that are code symbols if
     // requested
-    if (options.include_symbols) {
+    if (options.include_symbols && (!options.match_c_linkage_names ||
+                                    symbols->MayContainCLinkageSymbols(
+                                        lookup_info.GetName().GetStringRef(),
+                                        SymbolNameLookupKind::Function))) {
       if (Symtab *symtab = symbols->GetSymtab()) {
-        symtab->FindFunctionSymbols(lookup_info.GetLookupName(),
-                                    lookup_info.GetNameTypeMask(), sc_list);
+        symtab->FindFunctionSymbols(options.match_c_linkage_names
+                                        ? lookup_info.GetName()
+                                        : lookup_info.GetLookupName(),
+                                    lookup_info.GetNameTypeMask(), sc_list,
+                                    options.match_c_linkage_names);
       }
     }
   }
@@ -1438,13 +1442,32 @@ void Module::FindFunctionSymbols(ConstString name, uint32_t name_type_mask,
 
 void Module::FindSymbolsWithNameAndType(ConstString name,
                                         SymbolType symbol_type,
-                                        SymbolContextList &sc_list) {
+                                        SymbolContextList &sc_list,
+                                        bool match_c_linkage_names,
+                                        bool include_undefined) {
   // No need to protect this call using m_mutex all other method calls are
   // already thread safe.
-  if (Symtab *symtab = GetSymtab()) {
-    std::vector<uint32_t> symbol_indexes;
-    symtab->FindAllSymbolsWithNameAndType(name, symbol_type, symbol_indexes);
-    SymbolIndicesToSymbolContextList(symtab, symbol_indexes, sc_list);
+  if (SymbolFile *symbols = GetSymbolFile()) {
+    if (match_c_linkage_names &&
+        !symbols->MayContainCLinkageSymbols(
+            name.GetStringRef(), include_undefined
+                                     ? SymbolNameLookupKind::Any
+                                     : SymbolNameLookupKind::Defined))
+      return;
+    if (Symtab *symtab = symbols->GetSymtab()) {
+      std::vector<uint32_t> symbol_indexes;
+      symtab->FindAllSymbolsWithNameAndType(name, symbol_type, symbol_indexes,
+                                            match_c_linkage_names);
+      if (include_undefined) {
+        SymbolIndicesToSymbolContextList(symtab, symbol_indexes, sc_list);
+      } else {
+        SymbolContextList matches;
+        SymbolIndicesToSymbolContextList(symtab, symbol_indexes, matches);
+        for (const SymbolContext &match : matches)
+          if (match.symbol->GetType() != eSymbolTypeUndefined)
+            sc_list.Append(match);
+      }
+    }
   }
 }
 
@@ -1793,7 +1816,9 @@ void Module::ClearModuleDependentCaches() {
 #endif // LLDB_ENABLE_SWIFT
 }
 
-std::vector<DataBufferSP> Module::GetASTData(lldb::LanguageType language) {
+std::vector<DataBufferSP>
+Module::GetASTData(lldb::LanguageType language,
+                   llvm::StringSet<> *loaded_ast_files) {
   std::vector<DataBufferSP> ast_datas;
 
   if (language != eLanguageTypeSwift)
@@ -1821,7 +1846,7 @@ std::vector<DataBufferSP> Module::GetASTData(lldb::LanguageType language) {
   // If we couldn't find it in the Module, then look for it in the SymbolFile:
   SymbolFile *sym_file = GetSymbolFile();
   if (sym_file)
-    ast_datas = sym_file->GetASTData(language);
+    ast_datas = sym_file->GetASTData(language, loaded_ast_files);
 
   return ast_datas;
 }

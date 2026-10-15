@@ -27,8 +27,11 @@
 #include "lldb/Utility/StructuredData.h"
 #include "lldb/Utility/XcodeSDK.h"
 #include "lldb/lldb-private.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Errc.h"
 
 #include <mutex>
@@ -148,6 +151,19 @@ public:
   virtual lldb::CompUnitSP GetCompileUnitAtIndex(uint32_t idx) = 0;
 
   virtual Symtab *GetSymtab(bool can_create = true) = 0;
+
+  /// Whether GetSymtab() may contain any of these exact linkage spellings.
+  ///
+  /// A false result guarantees that none of the names can match, including
+  /// names added by AddSymbols(). This does not describe DWARF functions or
+  /// inline instances and must not create the symbol table. Unknown providers
+  /// return true. Overrides must also preserve symbols in an existing table.
+  /// The query kind describes eligible final symbol-table types. Defined
+  /// includes named trampolines, while Function follows FindFunctionSymbols.
+  /// A true result can remain conservative for other symbol types.
+  virtual bool MayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      SymbolNameLookupKind kind = SymbolNameLookupKind::Any);
 
   virtual llvm::VersionTuple GetProducerVersion(CompileUnit &comp_unit) {
     return {};
@@ -432,11 +448,19 @@ public:
   ///   The language for which AST data is being requested.
   ///   A given file can contain ASTs for more than one language.
   ///
+  /// @param[in,out] loaded_ast_files
+  ///   If supplied, omit external files already successfully returned to this
+  ///   consumer and add newly loaded absolute paths. The consumer must keep
+  ///   the previous buffers alive and serialize calls sharing this set. Missing
+  ///   files must not be recorded, so a later image can retry them. The order
+  ///   of the remaining buffers is unchanged.
+  ///
   /// @return
   ///   Zero or more buffers, each of which contain the raw data
   ///   of an AST in the requested language.
   virtual std::vector<lldb::DataBufferSP>
-  GetASTData(lldb::LanguageType language);
+  GetASTData(lldb::LanguageType language,
+             llvm::StringSet<> *loaded_ast_files = nullptr);
 
   struct RegisterInfoResolver {
     virtual ~RegisterInfoResolver(); // anchor
@@ -689,6 +713,12 @@ public:
   }
 
 protected:
+  /// For providers whose AddSymbols() does not augment the main object file.
+  /// Providers that add symbols must use the conservative default instead.
+  bool MainObjectFileMayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      SymbolNameLookupKind kind = SymbolNameLookupKind::Any);
+
   virtual uint32_t CalculateNumCompileUnits() = 0;
   virtual lldb::CompUnitSP ParseCompileUnitAtIndex(uint32_t idx) = 0;
   virtual TypeList &GetTypeList() { return m_type_list; }

@@ -148,15 +148,29 @@ AppleObjCRuntimeV2 *SwiftLanguageRuntime::GetObjCRuntime() const {
 
 enum class RuntimeKind { Swift, ObjC };
 
+static bool HasSwiftRuntimeSymbol(Module &image, ConstString name) {
+  SymbolContextList matches;
+  // These runtime entry points have C linkage. The presence probe need not
+  // build name indexes or demangle unrelated Swift and C++ symbols.
+  image.FindSymbolsWithNameAndType(name, eSymbolTypeAny, matches,
+                                   /*match_c_linkage_names=*/true);
+  for (const SymbolContext &match : matches) {
+    // The legacy name index excludes trampolines; retain that presence rule.
+    if (match.symbol && !match.symbol->IsTrampoline())
+      return true;
+  }
+  return false;
+}
+
 /// Detect a statically linked Swift runtime by looking for a well-known symbol.
 static bool IsStaticSwiftRuntime(Module &image) {
   static ConstString swift_reflection_version_sym("swift_release");
-  return image.FindFirstSymbolWithNameAndType(swift_reflection_version_sym);
+  return HasSwiftRuntimeSymbol(image, swift_reflection_version_sym);
 }
 
 static bool IsStaticSwiftConcurrency(Module &image) {
   static const ConstString task_switch_symbol("_swift_task_switch");
-  return image.FindFirstSymbolWithNameAndType(task_switch_symbol);
+  return HasSwiftRuntimeSymbol(image, task_switch_symbol);
 }
 
 /// \return the Swift or Objective-C runtime found in the loaded images.
