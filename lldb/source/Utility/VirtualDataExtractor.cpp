@@ -49,15 +49,15 @@ bool VirtualDataExtractor::ValidateVirtualRead(offset_t virtual_addr,
   if (!entry)
     return false;
 
-  // Assert that the read does not cross entry boundaries.
-  // RangeData.Contains() checks if a range is fully contained.
-  assert(entry->Contains(LookupTable::Range(virtual_addr, length)) &&
-         "Read crosses lookup table entry boundary");
-
-  // Also validate that the physical offset is within the data buffer.
-  // RangeData.data contains the physical offset.
-  offset_t physical_offset = entry->data + (virtual_addr - entry->base);
-  return ValidOffsetForDataOfSize(physical_offset, length);
+  // A malformed or partial mapped image must not cross a lookup region or
+  // wrap while translating its virtual range into the backing buffer.
+  const offset_t delta = virtual_addr - entry->base;
+  if (delta > entry->size || length > entry->size - delta ||
+      length > UINT64_MAX - virtual_addr)
+    return false;
+  const offset_t physical_size = GetPhysicalByteSize();
+  return entry->data <= physical_size && delta <= physical_size - entry->data &&
+         length <= physical_size - entry->data - delta;
 }
 
 const void *VirtualDataExtractor::GetData(offset_t *offset_ptr,
@@ -163,10 +163,12 @@ uint64_t VirtualDataExtractor::GetVirtualByteSize() const {
   offset_t lowest = -1ULL;
   offset_t highest = 0;
   for (const auto ent : m_lookup_table) {
+    if (ent.size > UINT64_MAX - ent.base)
+      return 0;
     lowest = std::min(lowest, ent.base);
     highest = std::max(highest, ent.base + ent.size);
   }
-  return highest - lowest;
+  return lowest == UINT64_MAX ? 0 : highest - lowest;
 }
 
 uint64_t VirtualDataExtractor::GetPhysicalByteSize() const {
@@ -249,30 +251,11 @@ uint64_t VirtualDataExtractor::GetU64_unchecked(offset_t *offset_ptr) const {
 DataExtractorSP
 VirtualDataExtractor::GetSubsetExtractorSP(offset_t virtual_offset,
                                            offset_t virtual_length) {
+  if (!ValidateVirtualRead(virtual_offset, virtual_length))
+    return {};
   const LookupTable::Entry *entry = FindEntry(virtual_offset);
-  assert(
-      entry &&
-      "VirtualDataExtractor subset extractor requires valid virtual address");
-  if (!entry)
-    return {};
-
-  // Entry::data is the offset into the DataBuffer's actual start/end range
-  // Entry::base is the virtual address at the start of this region of data
-  offset_t offset_into_entry_range = virtual_offset - entry->base;
-  assert(
-      offset_into_entry_range + virtual_length <= entry->size &&
-      "VirtualDataExtractor subset may not span multiple LookupTable entries");
-  if (offset_into_entry_range + virtual_length > entry->size)
-    return {};
-
-  // We could support a Subset VirtualDataExtractor which covered
-  // multiple LookupTable virtual entries, but we'd need to mutate
-  // all of the LookupTable entries that were properly included in
-  // the Subset, a bit tricky.  So we won't implement that until it's
-  // needed.
-
-  offset_t physical_start = entry->data + offset_into_entry_range;
-  std::shared_ptr<DataExtractor> new_sp = std::make_shared<DataExtractor>(
+  const offset_t physical_start = entry->data + (virtual_offset - entry->base);
+  auto new_sp = std::make_shared<DataExtractor>(
       GetSharedDataBuffer(), GetByteOrder(), GetAddressByteSize());
   new_sp->SetData(GetSharedDataBuffer(), physical_start, virtual_length);
   return new_sp;
@@ -283,22 +266,10 @@ VirtualDataExtractor::GetSubsetExtractorSP(offset_t virtual_offset,
 DataExtractorSP
 VirtualDataExtractor::GetSubsetExtractorSP(offset_t virtual_offset) {
   const LookupTable::Entry *entry = FindEntry(virtual_offset);
-  assert(
-      entry &&
-      "VirtualDataExtractor subset extractor requires valid virtual address");
-  if (!entry)
+  if (!entry || virtual_offset - entry->base > entry->size)
     return {};
-
-  // Entry::data is the offset into the DataBuffer's actual start/end range
-  // Entry::base is the virtual address at the start of this region of data
-  offset_t offset_into_entry_range = virtual_offset - entry->base;
-
-  offset_t physical_start = entry->data + offset_into_entry_range;
-  std::shared_ptr<DataExtractor> new_sp = std::make_shared<DataExtractor>(
-      GetSharedDataBuffer(), GetByteOrder(), GetAddressByteSize());
-  new_sp->SetData(GetSharedDataBuffer(), physical_start,
-                  entry->size - offset_into_entry_range);
-  return new_sp;
+  return GetSubsetExtractorSP(virtual_offset,
+                              entry->size - (virtual_offset - entry->base));
 }
 
 // Return an ArrayRef to the first contiguous region of the LookupTable

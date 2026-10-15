@@ -46,6 +46,11 @@ public:
 
   uint32_t CalculateAbilities() override;
 
+  bool MayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      lldb_private::SymbolNameLookupKind kind =
+          lldb_private::SymbolNameLookupKind::Any) override;
+
   // Compile Unit function calls
   lldb::LanguageType
   ParseLanguage(lldb_private::CompileUnit &comp_unit) override;
@@ -87,6 +92,14 @@ public:
 
   // PluginInterface protocol
   llvm::StringRef GetPluginName() override { return GetPluginNameStatic(); }
+
+private:
+  uint32_t InitializeSymtabIndexes();
+  void EnsureSymtabIndexes();
+  // Only CreateInstance constructs an exact vanilla provider. Publicly
+  // constructed instances and subclasses keep the original eager contract.
+  bool m_factory_instance = false;
+  bool m_indexes_deferred = false;
 
 protected:
   uint32_t CalculateNumCompileUnits() override;

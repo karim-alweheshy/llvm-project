@@ -24,6 +24,8 @@
 using namespace lldb;
 using namespace lldb_private;
 
+static constexpr llvm::StringLiteral MatchCLinkageNames("MatchCLinkageNames");
+
 BreakpointResolverName::BreakpointResolverName(
     const BreakpointSP &bkpt, const char *name_cstr,
     FunctionNameType name_type_mask, LanguageType language,
@@ -86,7 +88,8 @@ BreakpointResolverName::BreakpointResolverName(
                          rhs.GetOffset(), rhs.GetOffsetIsInsnCount()),
       m_lookups(rhs.m_lookups), m_class_name(rhs.m_class_name),
       m_regex(rhs.m_regex), m_match_type(rhs.m_match_type),
-      m_language(rhs.m_language), m_skip_prologue(rhs.m_skip_prologue) {}
+      m_language(rhs.m_language), m_skip_prologue(rhs.m_skip_prologue),
+      m_match_c_linkage_names(rhs.m_match_c_linkage_names) {}
 
 BreakpointResolverSP BreakpointResolverName::CreateFromStructuredData(
     const StructuredData::Dictionary &options_dict, Status &error) {
@@ -119,10 +122,24 @@ BreakpointResolverSP BreakpointResolverName::CreateFromStructuredData(
     return nullptr;
   }
 
+  bool match_c_linkage_names = false;
+  if (options_dict.HasKey(MatchCLinkageNames) &&
+      !options_dict.GetValueForKeyAsBoolean(MatchCLinkageNames,
+                                            match_c_linkage_names)) {
+    error = Status::FromErrorString(
+        "BRN::CFSD: MatchCLinkageNames entry is not a boolean.");
+    return nullptr;
+  }
+
   llvm::StringRef regex_text;
   success = options_dict.GetValueForKeyAsString(
       GetKey(OptionNames::RegexString), regex_text);
   if (success) {
+    if (match_c_linkage_names) {
+      error = Status::FromErrorString(
+          "BRN::CFSD: C linkage names require an exact-name resolver.");
+      return nullptr;
+    }
     return std::make_shared<BreakpointResolverName>(
         nullptr, RegularExpression(regex_text), language, offset,
         skip_prologue);
@@ -184,6 +201,7 @@ BreakpointResolverSP BreakpointResolverName::CreateFromStructuredData(
     for (size_t i = 1; i < num_elem; i++) {
       resolver_sp->AddNameLookup(ConstString(names[i]), name_masks[i]);
     }
+    resolver_sp->SetMatchCLinkageNames(match_c_linkage_names);
     return resolver_sp;
 }
 
@@ -212,6 +230,9 @@ StructuredData::ObjectSP BreakpointResolverName::SerializeToStructuredData() {
         Language::GetNameForLanguageType(m_language));
   options_dict_sp->AddBooleanItem(GetKey(OptionNames::SkipPrologue),
                                   m_skip_prologue);
+
+  if (m_match_c_linkage_names)
+    options_dict_sp->AddBooleanItem(MatchCLinkageNames, true);
 
   return WrapOptionsDict(options_dict_sp);
 }
@@ -274,6 +295,7 @@ BreakpointResolverName::SearchCallback(SearchFilter &filter,
   ModuleFunctionSearchOptions function_options;
   function_options.include_symbols = !filter_by_cu;
   function_options.include_inlines = true;
+  function_options.match_c_linkage_names = m_match_c_linkage_names;
 
   switch (m_match_type) {
   case Breakpoint::Exact:

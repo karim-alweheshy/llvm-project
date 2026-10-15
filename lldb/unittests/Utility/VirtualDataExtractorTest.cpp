@@ -661,3 +661,40 @@ TEST(VirtualDataExtractorTest, SubsetExtractorGetU32) {
   // Entry(0x0, 4*sizeof(uint32_t), 12*sizeof(uint32_t))
   EXPECT_EQ(extractor->GetU32(&virtual_offset), 0xccccccccU);
 }
+
+TEST(VirtualDataExtractorTest, CheckedSubsetsRejectGapsTruncationAndOverflow) {
+  const uint8_t bytes[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  auto buffer = std::make_shared<DataBufferHeap>(bytes, sizeof(bytes));
+  auto extractor = std::make_shared<VirtualDataExtractor>(
+      buffer, eByteOrderLittle, 8, Table{Entry(0, 4, 0), Entry(0x1000, 4, 4)});
+  auto subset = extractor->GetSubsetExtractorSP(0x1001, 3);
+  ASSERT_NE(subset, nullptr);
+  EXPECT_EQ(subset->GetByteSize(), 3u);
+  EXPECT_EQ(extractor->GetSubsetExtractorSP(3, 2), nullptr);
+  EXPECT_EQ(extractor->GetSubsetExtractorSP(4, 1), nullptr);
+  EXPECT_EQ(extractor->GetSubsetExtractorSP(0x800, 1), nullptr);
+  EXPECT_EQ(extractor->GetSubsetExtractorSP(0x1000, UINT64_MAX), nullptr);
+  EXPECT_EQ(extractor->GetSubsetExtractorSP(0x1004), nullptr);
+  offset_t offset = 3;
+  EXPECT_EQ(extractor->GetData(&offset, 2), nullptr);
+  EXPECT_EQ(offset, 3u);
+  // The subset owns the backing buffer after the parent is released.
+  extractor.reset();
+  buffer.reset();
+  offset = 0;
+  EXPECT_EQ(subset->GetU8(&offset), 6u);
+
+  VirtualDataExtractor truncated(
+      std::make_shared<DataBufferHeap>(bytes, sizeof(bytes)), eByteOrderLittle,
+      8, Table{Entry(0, 8, 4)});
+  EXPECT_EQ(truncated.GetSubsetExtractorSP(0, 8), nullptr);
+  EXPECT_EQ(truncated.GetSubsetExtractorSP(4), nullptr);
+  VirtualDataExtractor physical_overflow(
+      std::make_shared<DataBufferHeap>(bytes, sizeof(bytes)), eByteOrderLittle,
+      8, Table{Entry(0, 4, UINT64_MAX - 1)});
+  EXPECT_EQ(physical_overflow.GetSubsetExtractorSP(1, 1), nullptr);
+  VirtualDataExtractor virtual_overflow(
+      std::make_shared<DataBufferHeap>(bytes, sizeof(bytes)), eByteOrderLittle,
+      8, Table{Entry(UINT64_MAX - 3, 3, 0)});
+  EXPECT_EQ(virtual_overflow.GetSubsetExtractorSP(UINT64_MAX - 2, 4), nullptr);
+}

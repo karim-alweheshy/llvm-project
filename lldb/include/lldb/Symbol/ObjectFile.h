@@ -22,6 +22,7 @@
 #include "lldb/Utility/StructuredData.h"
 #include "lldb/Utility/UUID.h"
 #include "lldb/lldb-private.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/VersionTuple.h"
 #include <optional>
@@ -322,6 +323,42 @@ public:
   /// \return
   ///     The symbol table for this object file.
   Symtab *GetSymtab(bool can_create = true);
+
+  struct DebugMapObjectFile {
+    std::string source_file;
+    std::string object_file;
+    uint64_t modification_time;
+  };
+
+  struct DebugInfoMetadata {
+    /// Ordered external Swift AST references. Strings borrow object-file data.
+    std::vector<llvm::StringRef> swift_ast_files;
+    /// Nullopt requires the normal symbol parser for debug-map discovery.
+    std::optional<std::vector<DebugMapObjectFile>> debug_map_objects;
+    /// True proves that the final symbol table has no STABS/SourceFile entries
+    /// and at least one Code and one Data entry. False leaves this unproved.
+    bool has_no_stabs_and_code_and_data = false;
+  };
+
+  /// Read format-owned debug references without creating a symbol table.
+  /// The result and its strings live as long as this object file. Unsupported
+  /// formats, malformed data and an existing (possibly augmented) symbol table
+  /// return nullptr. Callers must retain the normal symbol-table fallback.
+  virtual const DebugInfoMetadata *GetDebugInfoMetadata() { return nullptr; }
+
+  /// False proves that the unmaterialized symbol table cannot contain any of
+  /// these exact linkage spellings. A format may support only some spellings;
+  /// unsupported or augmented tables return true.
+  /// This says nothing about functions available through a symbol-file
+  /// provider. The query kind describes which final symbol types may match;
+  /// Defined includes named trampolines, while Function excludes them and must
+  /// still cover possible resolver promotions. True is conservative, not proof
+  /// that a matching symbol of that kind exists.
+  virtual bool MayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      SymbolNameLookupKind kind = SymbolNameLookupKind::Any) {
+    return true;
+  }
 
   /// Parse the symbol table into the provides symbol table object.
   ///

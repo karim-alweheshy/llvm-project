@@ -13,6 +13,7 @@
 #include "lldb/Symbol/SymbolFile.h"
 #include "lldb/Utility/RangeMap.h"
 #include "llvm/Support/Chrono.h"
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <optional>
@@ -62,6 +63,11 @@ public:
   ~SymbolFileDWARFDebugMap() override;
 
   uint32_t CalculateAbilities() override;
+  bool MayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      SymbolNameLookupKind kind = SymbolNameLookupKind::Any) override {
+    return MainObjectFileMayContainCLinkageSymbols(names, kind);
+  }
   void InitializeObject() override;
 
   // Compile Unit function calls
@@ -137,7 +143,8 @@ public:
   ParseCallEdgesInFunction(UserID func_id) override;
 
   std::vector<lldb::DataBufferSP>
-  GetASTData(lldb::LanguageType language) override;
+  GetASTData(lldb::LanguageType language,
+             llvm::StringSet<> *loaded_ast_files = nullptr) override;
 
   void DumpClangAST(Stream &s, llvm::StringRef filter) override;
 
@@ -161,7 +168,7 @@ public:
   ResolveFunctionCallLabel(FunctionCallLabel &label) override;
 
 protected:
-  enum { kHaveInitializedOSOs = (1 << 0), kNumFlags };
+  enum { kHaveInitializedOSOMetadata, kHaveInitializedOSOs, kNumFlags };
 
   friend class DebugMapModule;
   friend class DWARFASTParserSwift;
@@ -203,6 +210,7 @@ protected:
   };
 
   // Protected Member Functions
+  void InitOSOMetadata();
   void InitOSO();
 
   /// This function actually returns the number of object files, which may be
@@ -334,6 +342,10 @@ protected:
 
   // Member Variables
   std::bitset<kNumFlags> m_flags;
+  /// Publish completed ranges/indices without locking the parent module on
+  /// already initialized OSO worker callbacks. The in-progress bit in m_flags
+  /// is only inspected while holding GetModuleMutex().
+  std::atomic<bool> m_oso_indexes_initialized{false};
   std::vector<CompileUnitInfo> m_compile_unit_infos;
   std::vector<uint32_t> m_func_indexes; // Sorted by address
   std::vector<uint32_t> m_glob_indexes;

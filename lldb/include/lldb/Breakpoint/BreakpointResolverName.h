@@ -58,6 +58,15 @@ public:
 
   ~BreakpointResolverName() override = default;
 
+  /// Match exact C linkage names in the symbol table without building indexes
+  /// of demangled names. DWARF lookup and name pruning retain their established
+  /// behavior, including extern "C" definitions with synthesized display names.
+  /// This option applies only to exact-name resolvers.
+  void SetMatchCLinkageNames(bool match) {
+    assert(!match || m_match_type == Breakpoint::Exact);
+    m_match_c_linkage_names = match;
+  }
+
   Searcher::CallbackReturn SearchCallback(SearchFilter &filter,
                                           SymbolContext &context,
                                           Address *addr) override;
@@ -86,6 +95,7 @@ protected:
   Breakpoint::MatchType m_match_type;
   lldb::LanguageType m_language;
   bool m_skip_prologue;
+  bool m_match_c_linkage_names = false;
 
   void AddNameLookup(ConstString name,
                      lldb::FunctionNameType name_type_mask);

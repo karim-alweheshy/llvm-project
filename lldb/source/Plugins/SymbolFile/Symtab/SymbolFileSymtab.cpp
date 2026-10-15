@@ -44,7 +44,9 @@ llvm::StringRef SymbolFileSymtab::GetPluginDescriptionStatic() {
 }
 
 SymbolFile *SymbolFileSymtab::CreateInstance(ObjectFileSP objfile_sp) {
-  return new SymbolFileSymtab(std::move(objfile_sp));
+  auto *result = new SymbolFileSymtab(std::move(objfile_sp));
+  result->m_factory_instance = true;
+  return result;
 }
 
 void SymbolFileSymtab::GetTypes(SymbolContextScope *sc_scope,
@@ -56,6 +58,31 @@ SymbolFileSymtab::SymbolFileSymtab(ObjectFileSP objfile_sp)
       m_func_indexes(), m_code_indexes(), m_objc_class_name_to_index() {}
 
 uint32_t SymbolFileSymtab::CalculateAbilities() {
+  if (m_factory_instance && m_objfile_sp && !m_objfile_sp->GetSymtab(false)) {
+    if (const auto *metadata = m_objfile_sp->GetDebugInfoMetadata()) {
+      if (metadata->has_no_stabs_and_code_and_data) {
+        m_indexes_deferred = true;
+        return Functions | GlobalVariables;
+      }
+    }
+  }
+  return InitializeSymtabIndexes();
+}
+
+bool SymbolFileSymtab::MayContainCLinkageSymbols(
+    llvm::ArrayRef<llvm::StringRef> names, SymbolNameLookupKind kind) {
+  return !m_factory_instance ||
+         MainObjectFileMayContainCLinkageSymbols(names, kind);
+}
+
+void SymbolFileSymtab::EnsureSymtabIndexes() {
+  if (m_indexes_deferred) {
+    InitializeSymtabIndexes();
+    m_indexes_deferred = false;
+  }
+}
+
+uint32_t SymbolFileSymtab::InitializeSymtabIndexes() {
   uint32_t abilities = 0;
   if (m_objfile_sp) {
     const Symtab *symtab = m_objfile_sp->GetSymtab();
@@ -97,10 +124,16 @@ uint32_t SymbolFileSymtab::CalculateAbilities() {
       }
     }
   }
+  m_indexes_deferred = false;
   return abilities;
 }
 
 uint32_t SymbolFileSymtab::CalculateNumCompileUnits() {
+  // A complete no-STAB proof also proves that a cold table has no source units.
+  // Import/reflection consumers must not hydrate all symbols just to ask this.
+  if (m_indexes_deferred && !m_objfile_sp->GetSymtab(false))
+    return 0;
+  EnsureSymtabIndexes();
   // If we don't have any source file symbols we will just have one compile
   // unit for the entire object file
   if (m_source_indexes.empty())
@@ -112,6 +145,9 @@ uint32_t SymbolFileSymtab::CalculateNumCompileUnits() {
 }
 
 CompUnitSP SymbolFileSymtab::ParseCompileUnitAtIndex(uint32_t idx) {
+  if (m_indexes_deferred && !m_objfile_sp->GetSymtab(false))
+    return {};
+  EnsureSymtabIndexes();
   CompUnitSP cu_sp;
 
   // If we don't have any source file symbols we will just have one compile
@@ -134,6 +170,7 @@ lldb::LanguageType SymbolFileSymtab::ParseLanguage(CompileUnit &comp_unit) {
 
 size_t SymbolFileSymtab::ParseFunctions(CompileUnit &comp_unit) {
   std::lock_guard<std::recursive_mutex> guard(GetModuleMutex());
+  EnsureSymtabIndexes();
   size_t num_added = 0;
   // We must at least have a valid compile unit
   const Symtab *symtab = m_objfile_sp->GetSymtab();

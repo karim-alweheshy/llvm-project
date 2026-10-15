@@ -115,6 +115,12 @@ public:
 
   uint32_t CalculateAbilities() override;
 
+  bool MayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      SymbolNameLookupKind kind = SymbolNameLookupKind::Any) override {
+    return MainObjectFileMayContainCLinkageSymbols(names, kind);
+  }
+
   void InitializeObject() override;
 
   // Compile Unit function calls

@@ -33,6 +33,7 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StableHashing.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include <optional>
 #include "llvm/Support/Chrono.h"
 
@@ -70,6 +71,9 @@ struct ModuleFunctionSearchOptions {
   bool include_symbols = false;
   /// Include inlined functions.
   bool include_inlines = false;
+  /// Match exact C linkage names in the symbol table without demangling other
+  /// symbols. DWARF function lookup retains its normal source-name behavior.
+  bool match_c_linkage_names = false;
 };
 
 /// \class Module Module.h "lldb/Core/Module.h"
@@ -263,9 +267,16 @@ public:
   const Symbol *FindFirstSymbolWithNameAndType(
       ConstString name, lldb::SymbolType symbol_type = lldb::eSymbolTypeAny);
 
+  /// When match_c_linkage_names is true, match exact linkage spellings without
+  /// demangling unrelated symbols. Providers may conservatively require the
+  /// full symbol table even when the object-file metadata has no such name.
+  /// include_undefined=false excludes Undefined symbols from newly appended
+  /// results; it does not change contexts already in sc_list.
   void FindSymbolsWithNameAndType(ConstString name,
                                   lldb::SymbolType symbol_type,
-                                  SymbolContextList &sc_list);
+                                  SymbolContextList &sc_list,
+                                  bool match_c_linkage_names = false,
+                                  bool include_undefined = true);
 
   void FindSymbolsMatchingRegExAndType(
       const RegularExpression &regex, lldb::SymbolType symbol_type,
@@ -915,7 +926,13 @@ public:
     m_type_system_map = type_system_map;
   }
 
-  std::vector<lldb::DataBufferSP> GetASTData(lldb::LanguageType language);
+  /// Return AST data, optionally omitting external files already loaded by
+  /// this consumer. The consumer must retain previously returned buffers while
+  /// reusing loaded_ast_files and serialize calls sharing it. Missing files
+  /// are never added to the set; the remaining buffers keep their order.
+  std::vector<lldb::DataBufferSP>
+  GetASTData(lldb::LanguageType language,
+             llvm::StringSet<> *loaded_ast_files = nullptr);
 
   /// Update the ArchSpec to a more specific variant.
   bool MergeArchitecture(const ArchSpec &arch_spec);

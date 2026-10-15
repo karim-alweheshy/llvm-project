@@ -18,6 +18,9 @@
 #include "lldb/Utility/RangeMap.h"
 #include "lldb/Utility/StreamString.h"
 #include "lldb/Utility/UUID.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include <optional>
 
 // This class needs to be hidden as eventually belongs in a plugin that
@@ -100,6 +103,13 @@ public:
 
   void ParseSymtab(lldb_private::Symtab &symtab) override;
 
+  const DebugInfoMetadata *GetDebugInfoMetadata() override;
+
+  bool MayContainCLinkageSymbols(
+      llvm::ArrayRef<llvm::StringRef> names,
+      lldb_private::SymbolNameLookupKind kind =
+          lldb_private::SymbolNameLookupKind::Any) override;
+
   bool IsStripped() override;
 
   void CreateSections(lldb_private::SectionList &unified_section_list) override;
@@ -168,6 +178,52 @@ public:
 
   // PluginInterface protocol
   llvm::StringRef GetPluginName() override { return GetPluginNameStatic(); }
+
+private:
+  struct SymbolData {
+    lldb_private::DataExtractor nlists;
+    lldb_private::DataExtractor strings;
+    lldb_private::DataExtractor exports;
+    uint32_t count = 0;
+    uint32_t stride = 0;
+    struct StubRange {
+      uint32_t first;
+      uint32_t count;
+    };
+    std::vector<StubRange> stub_ranges;
+    lldb_private::DataExtractor indirect_symbols;
+    bool stub_ranges_valid = true;
+  };
+
+  /// Ordinary files and complete local mapped-cache views only.
+  const SymbolData *GetSymbolData();
+  std::optional<llvm::BitVector>
+  ReadIndirectStubSymbols(const SymbolData &data);
+  struct LinkageNameFlags {
+    bool may_be_defined = false;
+    bool may_be_function = false;
+  };
+  std::optional<llvm::StringMap<LinkageNameFlags>>
+  ReadCLinkageNames(const SymbolData &data);
+  // The borrowed view starts after ABI normalization and contains an in-bounds
+  // NUL; visitors need not measure unrelated names. No view escapes this call.
+  bool ReadLinkageNames(
+      const SymbolData &data,
+      llvm::function_ref<void(llvm::ArrayRef<uint8_t>, LinkageNameFlags)> visit,
+      bool *has_resolvers = nullptr,
+      llvm::ArrayRef<llvm::StringRef> export_queries = {});
+  // Engaged only after a complete successful trie walk. The immutable view and
+  // this global resolver fact share the ObjectFile lifetime and Module mutex.
+  std::optional<bool> m_exports_have_resolvers;
+  bool m_c_linkage_names_initialized = false;
+  // Owned identifiers from one immutable supported snapshot. Each value
+  // records possible defined/function matches independently of the first query.
+  // A disengaged map after initialization could not prove a complete result.
+  std::optional<llvm::StringMap<LinkageNameFlags>> m_c_linkage_names;
+  bool m_symbol_data_initialized = false;
+  std::optional<SymbolData> m_symbol_data;
+  bool m_debug_metadata_initialized = false;
+  std::optional<DebugInfoMetadata> m_debug_metadata;
 
 protected:
   static lldb_private::UUID

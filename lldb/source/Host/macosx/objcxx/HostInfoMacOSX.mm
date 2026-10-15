@@ -820,6 +820,9 @@ static DataExtractorSP map_shared_cache_binary_segments(void *image) {
             g_dyld_image_segment_data_4HWTrace(image_copy, segmentName);
         (void)dispatch_data_create_map(data_from_libdyld, &seg.data, &seg.size);
 
+        // The VM size may include bytes not supplied by the mapped segment.
+        // Only publish ranges that are actually readable through this mapping.
+        seg.size = std::min<uint64_t>(seg.size, seg.vmsize);
         if (seg.size > 0 && seg.data != 0)
           segments.push_back(seg);
       });
@@ -852,9 +855,12 @@ static DataExtractorSP map_shared_cache_binary_segments(void *image) {
   // listed as offset 0x1000.
   uint64_t min_file_vm_addr = UINT64_MAX;
   for (const segment &seg : segments) {
+    if (seg.size > UINT64_MAX - (uint64_t)seg.data ||
+        seg.size > UINT64_MAX - seg.vmaddr)
+      return {};
     min_lldb_vm_addr = std::min(min_lldb_vm_addr, (uint64_t)seg.data);
     max_lldb_vm_addr =
-        std::max(max_lldb_vm_addr, (uint64_t)seg.data + seg.vmsize);
+        std::max(max_lldb_vm_addr, (uint64_t)seg.data + seg.size);
     min_file_vm_addr = std::min(min_file_vm_addr, (uint64_t)seg.vmaddr);
   }
   DataBufferSP data_sp = std::make_shared<DataBufferUnowned>(
@@ -862,7 +868,7 @@ static DataExtractorSP map_shared_cache_binary_segments(void *image) {
   VirtualDataExtractor::LookupTable remap_table;
   for (const segment &seg : segments)
     remap_table.Append(VirtualDataExtractor::LookupTable::Entry(
-        (uint64_t)seg.vmaddr - min_file_vm_addr, (uint64_t)seg.vmsize,
+        (uint64_t)seg.vmaddr - min_file_vm_addr, (uint64_t)seg.size,
         (uint64_t)seg.data - (uint64_t)min_lldb_vm_addr));
 
   return std::make_shared<VirtualDataExtractor>(data_sp, remap_table);

@@ -15,6 +15,7 @@
 #include "Plugins/Process/Utility/RegisterContextDarwin_x86_64.h"
 #include "lldb/Core/Debugger.h"
 #include "lldb/Core/Module.h"
+#include "lldb/Core/ModuleList.h"
 #include "lldb/Core/ModuleSpec.h"
 #include "lldb/Core/PluginManager.h"
 #include "lldb/Core/Progress.h"
@@ -2178,7 +2179,7 @@ static SymbolType GetSymbolType(const char *&symbol_name,
 }
 
 static std::optional<struct nlist_64>
-ParseNList(DataExtractor &nlist_data, lldb::offset_t &nlist_data_offset,
+ParseNList(const DataExtractor &nlist_data, lldb::offset_t &nlist_data_offset,
            size_t nlist_byte_size) {
   struct nlist_64 nlist;
   if (!nlist_data.ValidOffsetForDataOfSize(nlist_data_offset, nlist_byte_size))
@@ -2192,6 +2193,678 @@ ParseNList(DataExtractor &nlist_data, lldb::offset_t &nlist_data_offset,
 }
 
 enum { DebugSymbols = true, NonDebugSymbols = false };
+
+const ObjectFileMachO::SymbolData *ObjectFileMachO::GetSymbolData() {
+  if (m_symbol_data_initialized)
+    return m_symbol_data ? &*m_symbol_data : nullptr;
+  m_symbol_data_initialized = true;
+  if (IsInMemory())
+    return nullptr;
+  const bool local_cache = IsSharedCacheBinary();
+#if TARGET_OS_IPHONE
+  // This build's full parser can add supplemental cache-local symbols.
+  if (local_cache)
+    return nullptr;
+#endif
+  auto subset = [&](uint64_t start, uint64_t length) -> DataExtractorSP {
+    if (length > UINT64_MAX - start)
+      return {};
+    auto result = m_data_nsp->GetSubsetExtractorSP(start, length);
+    return result && result->GetByteSize() == length ? result : nullptr;
+  };
+  const uint64_t header_size = MachHeaderSizeFromMagic(m_header.magic);
+  auto commands = subset(0, header_size + uint64_t(m_header.sizeofcmds));
+  if (!commands)
+    return nullptr;
+  const DataExtractor &header_data = *commands;
+  uint64_t linkedit_original = 0, linkedit_size = 0, linkedit_vmaddr = 0;
+  bool have_linkedit = false;
+
+  SymtabCommandLargeOffsets command;
+  uint64_t export_offset = 0, export_size = 0;
+  bool have_symtab = false;
+  bool have_dysymtab = false;
+  uint32_t indirect_offset = 0, indirect_count = 0;
+  SymbolData data;
+  offset_t offset = MachHeaderSizeFromMagic(m_header.magic);
+  const uint64_t commands_end = offset + uint64_t(m_header.sizeofcmds);
+  for (uint32_t i = 0; i != m_header.ncmds; ++i) {
+    const offset_t start = offset;
+    if (offset > commands_end || commands_end - offset < 8)
+      return nullptr;
+    const uint32_t cmd = header_data.GetU32(&offset);
+    const uint32_t size = header_data.GetU32(&offset);
+    if (size < 8 || size > commands_end - start)
+      return nullptr;
+    if (cmd == LC_DYSYMTAB) {
+      if (have_dysymtab || size < sizeof(llvm::MachO::dysymtab_command)) {
+        data.stub_ranges_valid = false;
+      } else {
+        have_dysymtab = true;
+        offset =
+            start + offsetof(llvm::MachO::dysymtab_command, indirectsymoff);
+        indirect_offset = header_data.GetU32(&offset);
+        indirect_count = header_data.GetU32(&offset);
+      }
+    } else if (cmd == LC_SEGMENT || cmd == LC_SEGMENT_64) {
+      const bool is64 = cmd == LC_SEGMENT_64;
+      const uint32_t header_size = is64
+                                       ? sizeof(llvm::MachO::segment_command_64)
+                                       : sizeof(llvm::MachO::segment_command);
+      const uint32_t section_size =
+          is64 ? sizeof(llvm::MachO::section_64) : sizeof(llvm::MachO::section);
+      if (size < header_size) {
+        data.stub_ranges_valid = false;
+      } else {
+        if (local_cache &&
+            llvm::StringRef(reinterpret_cast<const char *>(
+                                header_data.PeekData(start + 8, 16)),
+                            16)
+                    .split('\0')
+                    .first == "__LINKEDIT") {
+          if (have_linkedit)
+            return nullptr;
+          have_linkedit = true;
+          offset = start + 24; // vmaddr follows the fixed-width segment name.
+          linkedit_vmaddr =
+              is64 ? header_data.GetU64(&offset) : header_data.GetU32(&offset);
+          offset =
+              start + (is64 ? offsetof(llvm::MachO::segment_command_64, fileoff)
+                            : offsetof(llvm::MachO::segment_command, fileoff));
+          linkedit_original =
+              is64 ? header_data.GetU64(&offset) : header_data.GetU32(&offset);
+          linkedit_size =
+              is64 ? header_data.GetU64(&offset) : header_data.GetU32(&offset);
+          if (linkedit_size > UINT64_MAX - linkedit_original)
+            return nullptr;
+        }
+        offset =
+            start + (is64 ? offsetof(llvm::MachO::segment_command_64, nsects)
+                          : offsetof(llvm::MachO::segment_command, nsects));
+        const uint32_t nsects = header_data.GetU32(&offset);
+        if (nsects > (size - header_size) / section_size) {
+          data.stub_ranges_valid = false;
+        } else {
+          for (uint32_t section = 0; section != nsects; ++section) {
+            const uint64_t section_start =
+                start + header_size + uint64_t(section) * section_size;
+            offset =
+                section_start + (is64 ? offsetof(llvm::MachO::section_64, flags)
+                                      : offsetof(llvm::MachO::section, flags));
+            const uint32_t flags = header_data.GetU32(&offset);
+            const uint32_t first = header_data.GetU32(&offset);
+            const uint32_t stub_size = header_data.GetU32(&offset);
+            if ((flags & SECTION_TYPE) != S_SYMBOL_STUBS || !stub_size)
+              continue;
+            offset =
+                section_start + (is64 ? offsetof(llvm::MachO::section_64, size)
+                                      : offsetof(llvm::MachO::section, size));
+            const uint64_t bytes = is64 ? header_data.GetU64(&offset)
+                                        : header_data.GetU32(&offset);
+            const uint64_t count = bytes / stub_size;
+            if (count > UINT32_MAX)
+              data.stub_ranges_valid = false;
+            else if (count)
+              data.stub_ranges.push_back({first, uint32_t(count)});
+          }
+        }
+      }
+    } else if (cmd == LC_SYMTAB) {
+      if (have_symtab || size < sizeof(llvm::MachO::symtab_command))
+        return nullptr;
+      have_symtab = true;
+      command.symoff = header_data.GetU32(&offset);
+      command.nsyms = header_data.GetU32(&offset);
+      command.stroff = header_data.GetU32(&offset);
+      command.strsize = header_data.GetU32(&offset);
+    } else if (cmd == LC_DYLD_EXPORTS_TRIE || cmd == LC_DYLD_INFO ||
+               cmd == LC_DYLD_INFO_ONLY) {
+      const bool trie = cmd == LC_DYLD_EXPORTS_TRIE;
+      if (size < (trie ? sizeof(llvm::MachO::linkedit_data_command)
+                       : sizeof(llvm::MachO::dyld_info_command)))
+        return nullptr;
+      if (!trie)
+        offset += 8 * sizeof(uint32_t);
+      const uint32_t data_offset = header_data.GetU32(&offset);
+      const uint32_t data_size = header_data.GetU32(&offset);
+      if (data_size) {
+        if (export_size)
+          return nullptr;
+        export_offset = data_offset;
+        export_size = data_size;
+      }
+    }
+    offset = start + size;
+  }
+  if (!have_symtab)
+    return nullptr;
+  uint64_t linkedit_translated = 0;
+  if (local_cache) {
+    // Validate the complete load-command walk before consulting UUID helpers.
+    auto module = GetModule();
+    const UUID uuid = GetUUID();
+    if (!module || !uuid || module->GetUUID() != uuid)
+      return nullptr;
+    SectionList *sections = GetSectionList();
+    auto linkedit = sections
+                        ? sections->FindSectionByName(GetSegmentNameLINKEDIT())
+                        : SectionSP();
+    if (!have_linkedit || !linkedit ||
+        linkedit_original != m_linkedit_original_offset ||
+        linkedit_vmaddr < m_text_address)
+      return nullptr;
+    linkedit_translated = linkedit->GetFileOffset();
+    if (linkedit_translated != linkedit_vmaddr - m_text_address)
+      return nullptr;
+  }
+  auto table = [&](uint64_t start, uint64_t length, DataExtractor &result) {
+    if (!length)
+      return true;
+    if (local_cache) {
+      if (start < linkedit_original ||
+          start - linkedit_original > linkedit_size ||
+          length > linkedit_size - (start - linkedit_original) ||
+          start - linkedit_original > UINT64_MAX - linkedit_translated)
+        return false;
+      start = linkedit_translated + (start - linkedit_original);
+    }
+    auto view = subset(start, length);
+    if (!view)
+      return false;
+    result = *view;
+    return true;
+  };
+  data.count = command.nsyms;
+  data.stride = GetAddressByteSize() == 8 ? sizeof(llvm::MachO::nlist_64)
+                                          : sizeof(llvm::MachO::nlist);
+  if (!table(command.symoff, uint64_t(data.count) * data.stride, data.nlists) ||
+      !table(command.stroff, command.strsize, data.strings) ||
+      !table(export_offset, export_size, data.exports))
+    return nullptr;
+  if (!data.stub_ranges.empty()) {
+    if (!have_dysymtab || !indirect_count ||
+        !table(indirect_offset, uint64_t(indirect_count) * sizeof(uint32_t),
+               data.indirect_symbols)) {
+      data.stub_ranges_valid = false;
+    } else {
+      for (const auto &range : data.stub_ranges)
+        if (uint64_t(range.first) + range.count > indirect_count)
+          data.stub_ranges_valid = false;
+    }
+  }
+  m_symbol_data = std::move(data);
+  return &*m_symbol_data;
+}
+
+const ObjectFile::DebugInfoMetadata *ObjectFileMachO::GetDebugInfoMetadata() {
+  auto module = GetModule();
+  if (!module)
+    return nullptr;
+  std::lock_guard<std::recursive_mutex> guard(module->GetMutex());
+  if (GetSymtab(false) ||
+      ModuleList::GetGlobalModuleListProperties().GetEnableLLDBIndexCache())
+    return nullptr;
+  if (m_debug_metadata_initialized)
+    return m_debug_metadata ? &*m_debug_metadata : nullptr;
+  m_debug_metadata_initialized = true;
+  const SymbolData *data = GetSymbolData();
+  if (!data)
+    return nullptr;
+
+  DebugInfoMetadata metadata;
+  metadata.debug_map_objects.emplace();
+  bool has_stabs = false, has_code = false, has_data = false;
+  std::optional<MachSymtabSectionInfo> section_info;
+  if (SectionList *sections = GetSectionList())
+    section_info.emplace(sections);
+  std::string source;
+  bool scope_has_oso = false;
+  uint8_t previous_type = 0;
+  const auto strings = data->strings.GetData();
+  // A final NUL terminates every in-bounds offset, including string suffixes.
+  // Without this proof, validate each referenced name separately.
+  const bool strings_terminated = !strings.empty() && strings.back() == 0;
+  offset_t offset = 0;
+  for (uint32_t i = 0; i != data->count; ++i) {
+    auto nlist = ParseNList(m_symbol_data->nlists, offset, data->stride);
+    if (!nlist)
+      return nullptr;
+    has_stabs |= (nlist->n_type & N_STAB) != 0;
+    if (!has_stabs && (!has_code || !has_data) &&
+        (nlist->n_type & N_TYPE) == N_SECT && nlist->n_sect && section_info) {
+      // Reuse the parser's cached address/section mapping, but decline its
+      // fallback for a raw section number that does not identify that section.
+      auto section = section_info->GetSection(nlist->n_sect, nlist->n_value);
+      if (section && section->GetID() == nlist->n_sect &&
+          (section->Get() & SECTION_TYPE) == S_REGULAR &&
+          section->GetName() != GetSectionNameEHFrame()) {
+        has_code |= section->GetType() == eSectionTypeCode;
+        has_data |= section->GetType() == eSectionTypeData;
+      }
+    }
+    if (strings_terminated) {
+      if (nlist->n_strx >= strings.size() ||
+          (!(nlist->n_type & N_STAB) && (nlist->n_type & N_TYPE) == N_INDR &&
+           nlist->n_value >= strings.size()))
+        return nullptr;
+      if (nlist->n_type != N_AST && nlist->n_type != N_SO &&
+          nlist->n_type != N_OSO) {
+        previous_type = nlist->n_type;
+        continue;
+      }
+    }
+    offset_t string_offset = nlist->n_strx;
+    const char *cstr = data->strings.GetCStr(&string_offset);
+    if (!cstr)
+      return nullptr;
+    llvm::StringRef name(cstr, string_offset - nlist->n_strx - 1);
+    if (!(nlist->n_type & N_STAB) && (nlist->n_type & N_TYPE) == N_INDR) {
+      offset_t target_offset = nlist->n_value;
+      if (!data->strings.GetCStr(&target_offset))
+        return nullptr;
+    }
+    // Match the symbol parser's removal of the Mach-O ABI prefix.
+    llvm::StringRef normalized = name;
+    normalized.consume_front("_");
+    if (nlist->n_type == N_AST) {
+      if (Mangled::IsMangledName(normalized))
+        return nullptr;
+      metadata.swift_ast_files.push_back(normalized);
+    }
+    if (metadata.debug_map_objects) {
+      if ((nlist->n_type == N_SO || nlist->n_type == N_OSO) &&
+          Mangled::IsMangledName(normalized)) {
+        metadata.debug_map_objects.reset();
+      } else if (nlist->n_type == N_SO) {
+        if (name.empty()) {
+          source.clear();
+          scope_has_oso = false;
+        } else if (source.empty()) {
+          source = normalized.str();
+        } else if (previous_type == N_SO && !scope_has_oso && !source.empty() &&
+                   source.back() == '/' &&
+                   source.find("//") == std::string::npos &&
+                   !name.contains('/')) {
+          source.append(name.data(), name.size());
+        } else {
+          metadata.debug_map_objects.reset();
+        }
+      } else if (nlist->n_type == N_OSO && nlist->n_desc == 1) {
+        // Only standard source/object pairs can avoid the full parser. In
+        // particular, raw nlist IDs are never used as compacted Symtab indices.
+        if (previous_type != N_SO || source.empty() || source.back() == '/' ||
+            scope_has_oso || name.empty()) {
+          metadata.debug_map_objects.reset();
+        } else {
+          metadata.debug_map_objects->push_back(
+              {source, normalized.str(), nlist->n_value});
+          scope_has_oso = true;
+        }
+      }
+    }
+    previous_type = nlist->n_type;
+  }
+  if (scope_has_oso)
+    metadata.debug_map_objects.reset(); // Missing terminating N_SO.
+  if (!has_stabs && has_code && has_data) {
+    bool has_resolvers = false;
+    if (ReadLinkageNames(
+            *data, [](llvm::ArrayRef<uint8_t>, LinkageNameFlags) {},
+            &has_resolvers) &&
+        !has_resolvers)
+      metadata.has_no_stabs_and_code_and_data = true;
+  }
+  m_debug_metadata = std::move(metadata);
+  return &*m_debug_metadata;
+}
+
+static bool IsCIdentifierStart(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static bool IsCLinkageIdentifier(llvm::StringRef name) {
+  return !name.empty() && IsCIdentifierStart(name.front()) &&
+         llvm::all_of(name,
+                      [](char c) {
+                        return IsCIdentifierStart(c) || (c >= '0' && c <= '9');
+                      }) &&
+         !name.starts_with("___lldb_unnamed_symbol");
+}
+
+bool ObjectFileMachO::MayContainCLinkageSymbols(
+    llvm::ArrayRef<llvm::StringRef> names, SymbolNameLookupKind kind) {
+  auto module = GetModule();
+  if (!module)
+    return true;
+  std::lock_guard<std::recursive_mutex> guard(module->GetMutex());
+  // Recheck these gates even after building the name set: a symbol table may
+  // have acquired symbols from a provider or runtime since the last query.
+  if (GetSymtab(false) ||
+      ModuleList::GetGlobalModuleListProperties().GetEnableLLDBIndexCache())
+    return true;
+  if (!llvm::all_of(names, IsCLinkageIdentifier)) {
+    auto is_swift_linkage = [](llvm::StringRef name) {
+      name.consume_front("_");
+      return name.consume_front("$s") && !name.empty() &&
+             llvm::all_of(name, [](char c) {
+               return IsCIdentifierStart(c) || (c >= '0' && c <= '9');
+             });
+    };
+    if (!llvm::all_of(names, [&](llvm::StringRef name) {
+          return IsCLinkageIdentifier(name) || is_swift_linkage(name);
+        }))
+      return true;
+    const SymbolData *data = GetSymbolData();
+    if (!data)
+      return true;
+    bool matched = false;
+    bool matched_defined = false;
+    auto match = [&](llvm::ArrayRef<uint8_t> name, LinkageNameFlags flags) {
+      if (kind != SymbolNameLookupKind::Any && !flags.may_be_defined)
+        return;
+      if (!llvm::any_of(names, [&](llvm::StringRef query) {
+            return name.size() > query.size() && name[query.size()] == 0 &&
+                   llvm::StringRef(reinterpret_cast<const char *>(name.data()),
+                                   query.size()) == query;
+          }))
+        return;
+      matched_defined |= flags.may_be_defined;
+      matched |=
+          kind == SymbolNameLookupKind::Any ||
+          (kind == SymbolNameLookupKind::Defined && flags.may_be_defined) ||
+          (kind == SymbolNameLookupKind::Function && flags.may_be_function);
+    };
+    // Exact modern Swift linkage queries do not retain unrelated Swift names.
+    // Once the complete trie is validated, only compatible export paths need
+    // revisiting. Nlist scanning and the global resolver proof remain intact.
+    bool has_resolvers = false;
+    if (!ReadLinkageNames(*data, match, &has_resolvers, names))
+      return true;
+    // A stub-only name may become a Resolver. Without recreating address
+    // classification, retain it whenever the complete trie has any resolver.
+    return matched || (kind == SymbolNameLookupKind::Function &&
+                       has_resolvers && matched_defined);
+  }
+  if (!m_c_linkage_names_initialized) {
+    m_c_linkage_names_initialized = true;
+    if (const SymbolData *data = GetSymbolData())
+      m_c_linkage_names = ReadCLinkageNames(*data);
+  }
+  if (!m_c_linkage_names)
+    return true;
+  return llvm::any_of(names, [&](llvm::StringRef name) {
+    auto entry = m_c_linkage_names->find(name);
+    if (entry == m_c_linkage_names->end())
+      return false;
+    switch (kind) {
+    case SymbolNameLookupKind::Any:
+      return true;
+    case SymbolNameLookupKind::Defined:
+      return entry->second.may_be_defined;
+    case SymbolNameLookupKind::Function:
+      return entry->second.may_be_function;
+    }
+    llvm_unreachable("Unknown symbol name lookup kind");
+  });
+}
+
+std::optional<llvm::BitVector>
+ObjectFileMachO::ReadIndirectStubSymbols(const SymbolData &data) {
+  if (!data.stub_ranges_valid)
+    return std::nullopt;
+  llvm::BitVector result(data.count);
+  for (const auto &range : data.stub_ranges) {
+    // ParseSymtab computes each indirect byte offset with uint32_t arithmetic.
+    // A wrapped offset could promote another raw undefined symbol instead.
+    if (uint64_t(range.first) + range.count >
+        uint64_t(UINT32_MAX) / sizeof(uint32_t) + 1)
+      return std::nullopt;
+    offset_t offset = uint64_t(range.first) * sizeof(uint32_t);
+    for (uint32_t i = 0; i != range.count; ++i) {
+      const uint32_t index = data.indirect_symbols.GetU32(&offset);
+      if (index & (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL))
+        continue;
+      if (index >= data.count)
+        return std::nullopt;
+      result.set(index);
+    }
+  }
+  return result;
+}
+
+std::optional<llvm::StringMap<ObjectFileMachO::LinkageNameFlags>>
+ObjectFileMachO::ReadCLinkageNames(const SymbolData &data) {
+  llvm::StringMap<LinkageNameFlags> result;
+  auto collect = [&](llvm::ArrayRef<uint8_t> name, LinkageNameFlags flags) {
+    if (name.empty() || !IsCIdentifierStart(name.front()))
+      return;
+    auto end = llvm::find_if(name, [](uint8_t c) {
+      return !IsCIdentifierStart(c) && !(c >= '0' && c <= '9');
+    });
+    if (end == name.end() || *end != 0)
+      return;
+    llvm::StringRef identifier(reinterpret_cast<const char *>(name.data()),
+                               end - name.begin());
+    if (!IsCLinkageIdentifier(identifier))
+      return;
+    auto entry = result.try_emplace(identifier, flags);
+    if (!entry.second) {
+      entry.first->second.may_be_defined |= flags.may_be_defined;
+      entry.first->second.may_be_function |= flags.may_be_function;
+    }
+  };
+  bool has_resolvers = false;
+  if (!ReadLinkageNames(data, collect, &has_resolvers))
+    return std::nullopt;
+  // Named indirect stubs are defined, but only resolver promotions can match
+  // FindFunctionSymbols. Any resolver terminal keeps the proof conservative.
+  if (has_resolvers)
+    for (auto &entry : result)
+      entry.second.may_be_function |= entry.second.may_be_defined;
+  return result;
+}
+
+bool ObjectFileMachO::ReadLinkageNames(
+    const SymbolData &data,
+    llvm::function_ref<void(llvm::ArrayRef<uint8_t>, LinkageNameFlags)> visit,
+    bool *has_resolvers, llvm::ArrayRef<llvm::StringRef> export_queries) {
+  // A raw undefined symbol can become a named trampoline or resolver. This
+  // temporary bit vector covers exactly the indirect entries used by stubs.
+  auto stub_symbols = ReadIndirectStubSymbols(data);
+  const auto strings = data.strings.GetData();
+  const bool strings_terminated = !strings.empty() && strings.back() == 0;
+  offset_t offset = 0;
+  for (uint32_t i = 0; i != data.count; ++i) {
+    auto nlist = ParseNList(data.nlists, offset, data.stride);
+    if (!nlist)
+      return false;
+    const uint8_t type = nlist->n_type & N_TYPE;
+    const bool definition =
+        (nlist->n_type & N_STAB) || (type != N_UNDF && type != N_PBUD);
+    const LinkageNameFlags flags{definition || !stub_symbols ||
+                                     stub_symbols->test(i),
+                                 definition || !stub_symbols};
+    if (strings_terminated) {
+      if (nlist->n_strx >= strings.size() ||
+          (!(nlist->n_type & N_STAB) && (nlist->n_type & N_TYPE) == N_INDR &&
+           nlist->n_value >= strings.size()))
+        return false;
+      auto name = strings.drop_front(nlist->n_strx);
+      if (name.front() == '_')
+        name = name.drop_front();
+      // A final NUL proves termination for every checked offset. The visitor
+      // can compare a requested prefix or stop at its first irrelevant byte.
+      visit(name, flags);
+      continue;
+    }
+    offset_t string_offset = nlist->n_strx;
+    const char *cstr = data.strings.GetCStr(&string_offset);
+    if (!cstr)
+      return false;
+    llvm::StringRef name(cstr, string_offset - nlist->n_strx - 1);
+    if (!(nlist->n_type & N_STAB) && (nlist->n_type & N_TYPE) == N_INDR) {
+      offset_t target_offset = nlist->n_value;
+      if (!data.strings.GetCStr(&target_offset))
+        return false;
+    }
+    name.consume_front("_");
+    visit(llvm::ArrayRef(reinterpret_cast<const uint8_t *>(name.data()),
+                         name.size() + 1),
+          flags);
+  }
+
+  // Export-only symbols and reexports can be absent from LC_SYMTAB. Walk
+  // their names without constructing Symbols or interning unrelated names.
+  const auto bytes = data.exports.GetData();
+  // Only a previous full successful walk can justify pruning. In particular,
+  // unvisited resolver terminals can promote an otherwise stub-only name.
+  const bool directed =
+      !export_queries.empty() && m_exports_have_resolvers.has_value();
+  bool resolvers = directed && *m_exports_have_resolvers;
+  if (bytes.empty()) {
+    m_exports_have_resolvers = false;
+    if (has_resolvers)
+      *has_resolvers = false;
+    return true;
+  }
+  auto read_uleb = [&](uint64_t &position, uint64_t &value) {
+    value = 0;
+    for (unsigned shift = 0; shift < 64 && position < bytes.size();
+         shift += 7) {
+      const uint8_t byte = bytes[position++];
+      if (shift == 63 && (byte & 0xfe))
+        return false;
+      value |= uint64_t(byte & 0x7f) << shift;
+      if (!(byte & 0x80))
+        return true;
+    }
+    return false;
+  };
+  auto read_string = [&](uint64_t &position) -> std::optional<llvm::StringRef> {
+    if (position >= bytes.size())
+      return std::nullopt;
+    const char *start = reinterpret_cast<const char *>(bytes.data() + position);
+    const char *end =
+        static_cast<const char *>(memchr(start, 0, bytes.size() - position));
+    if (!end)
+      return std::nullopt;
+    position += end - start + 1;
+    return llvm::StringRef(start, end - start);
+  };
+  struct Frame {
+    uint64_t position;
+    uint8_t remaining;
+    size_t parent_name_size;
+  };
+  std::vector<Frame> stack;
+  std::string name;
+  llvm::DenseSet<uint64_t> visited;
+  auto compatible_edge = [&](llvm::StringRef edge) {
+    return llvm::any_of(export_queries, [&](llvm::StringRef query) {
+      for (llvm::StringRef prefix :
+           {"", "OBJC_CLASS_$_", "OBJC_METACLASS_$_", "OBJC_IVAR_$_"}) {
+        size_t position = 0;
+        auto matches = [&](llvm::StringRef part) {
+          for (char c : part) {
+            // ParseTrieEntries drops one arbitrary byte of the whole name,
+            // including when that byte follows an empty edge.
+            if (!position++)
+              continue;
+            size_t index = position - 2;
+            if (index < prefix.size()) {
+              if (c != prefix[index])
+                return false;
+            } else {
+              index -= prefix.size();
+              if (index >= query.size() || c != query[index])
+                return false;
+            }
+          }
+          return true;
+        };
+        if (matches(name) && matches(edge))
+          return true;
+      }
+      return false;
+    });
+  };
+  auto enter_node = [&](uint64_t position, size_t parent_name_size) {
+    if (!visited.insert(position).second)
+      return false; // Cyclic or shared nodes require the normal parser.
+    uint64_t terminal_size;
+    if (!read_uleb(position, terminal_size) || position > bytes.size() ||
+        terminal_size > bytes.size() - position)
+      return false;
+    const uint64_t children = position + terminal_size;
+    if (terminal_size) {
+      uint64_t flags, value;
+      if (!read_uleb(position, flags) || (flags & ~uint64_t(0x1f)) ||
+          (flags & EXPORT_SYMBOL_FLAGS_KIND_MASK) == 3 ||
+          !read_uleb(position, value))
+        return false;
+      if (flags & EXPORT_SYMBOL_FLAGS_REEXPORT) {
+        if (!read_string(position))
+          return false;
+      } else if (flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER) {
+        resolvers = true;
+        if (!read_uleb(position, value))
+          return false;
+      }
+      if (position > children)
+        return false;
+      // ParseTrieEntries drops the first character of export names. Include
+      // every terminal here, even ones it may later reject by flags/address.
+      llvm::StringRef logical_name(name);
+      if (!logical_name.empty())
+        logical_name = logical_name.drop_front();
+      visit(
+          llvm::ArrayRef(reinterpret_cast<const uint8_t *>(logical_name.data()),
+                         logical_name.size() + 1),
+          {true, true});
+      // GetSymbolType can replace ObjC ABI spellings with their class/ivar
+      // spelling for trie-derived symbols. Include those possible aliases.
+      for (llvm::StringRef prefix :
+           {"OBJC_CLASS_$_", "OBJC_METACLASS_$_", "OBJC_IVAR_$_"})
+        if (logical_name.starts_with(prefix))
+          visit(llvm::ArrayRef(reinterpret_cast<const uint8_t *>(
+                                   logical_name.data() + prefix.size()),
+                               logical_name.size() - prefix.size() + 1),
+                {true, true});
+    }
+    if (children >= bytes.size())
+      return false;
+    stack.push_back({children + 1, bytes[children], parent_name_size});
+    return true;
+  };
+  if (!enter_node(0, 0))
+    return false;
+  while (!stack.empty()) {
+    Frame &frame = stack.back();
+    if (!frame.remaining) {
+      name.resize(frame.parent_name_size);
+      stack.pop_back();
+      continue;
+    }
+    --frame.remaining;
+    auto edge = read_string(frame.position);
+    uint64_t child;
+    if (!edge || !read_uleb(frame.position, child) || child >= bytes.size() ||
+        name.size() > bytes.size() - edge->size())
+      return false;
+    // The normal parser ignores a null child offset.
+    if (child && (!directed || compatible_edge(*edge))) {
+      const size_t parent_name_size = name.size();
+      name.append(edge->data(), edge->size());
+      if (!enter_node(child, parent_name_size))
+        return false;
+    }
+  }
+  if (!directed)
+    m_exports_have_resolvers = resolvers;
+  if (has_resolvers)
+    *has_resolvers = resolvers;
+  return true;
+}
 
 void ObjectFileMachO::ParseSymtab(Symtab &symtab) {
   ModuleSP module_sp(GetModule());
@@ -2486,32 +3159,46 @@ void ObjectFileMachO::ParseSymtab(Symtab &symtab) {
       exports_trie_load_command.dataoff += linkedit_slide;
     }
 
-    nlist_data = *m_data_nsp->GetSubsetExtractorSP(symtab_load_command.symoff,
-                                                   nlist_data_byte_size);
-    strtab_data = *m_data_nsp->GetSubsetExtractorSP(symtab_load_command.stroff,
-                                                    strtab_data_byte_size);
+    auto read_table = [&](uint64_t start, uint64_t length,
+                          DataExtractor &table) {
+      if (!length)
+        return true;
+      if (length > UINT64_MAX - start)
+        return false;
+      auto view = m_data_nsp->GetSubsetExtractorSP(start, length);
+      if (!view)
+        return false;
+      table = *view;
+      return true;
+    };
+    // Required mapped bytes may be unavailable after a partial/gapped cache
+    // view rejects metadata. Do not dereference a missing subset or try to
+    // read names from a null Process when a local string table is absent.
+    if (!read_table(symtab_load_command.symoff, nlist_data_byte_size,
+                    nlist_data) ||
+        !read_table(symtab_load_command.stroff, strtab_data_byte_size,
+                    strtab_data) ||
+        (nlist_data.GetByteSize() && !strtab_data.GetByteSize()))
+      return;
 
     // We shouldn't have exports data from both the LC_DYLD_INFO command
     // AND the LC_DYLD_EXPORTS_TRIE command in the same binary:
     lldbassert(!((dyld_info.export_size > 0)
                  && (exports_trie_load_command.datasize > 0)));
     if (dyld_info.export_size > 0) {
-      dyld_trie_data = *m_data_nsp->GetSubsetExtractorSP(dyld_info.export_off,
-                                                         dyld_info.export_size);
+      read_table(dyld_info.export_off, dyld_info.export_size, dyld_trie_data);
     } else if (exports_trie_load_command.datasize > 0) {
-      dyld_trie_data =
-          *m_data_nsp->GetSubsetExtractorSP(exports_trie_load_command.dataoff,
-                                            exports_trie_load_command.datasize);
+      read_table(exports_trie_load_command.dataoff,
+                 exports_trie_load_command.datasize, dyld_trie_data);
     }
 
     if (dysymtab.nindirectsyms != 0) {
-      indirect_symbol_index_data = *m_data_nsp->GetSubsetExtractorSP(
-          dysymtab.indirectsymoff, dysymtab.nindirectsyms * 4);
+      read_table(dysymtab.indirectsymoff, dysymtab.nindirectsyms * 4,
+                 indirect_symbol_index_data);
     }
     if (function_starts_load_command.cmd) {
-      function_starts_data = *m_data_nsp->GetSubsetExtractorSP(
-          function_starts_load_command.dataoff,
-          function_starts_load_command.datasize);
+      read_table(function_starts_load_command.dataoff,
+                 function_starts_load_command.datasize, function_starts_data);
     }
   }
 
